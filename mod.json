@@ -1,0 +1,7 @@
+{
+  "name": "气候与四季",
+  "author": "北魏闲鱼&AI",
+  "version": "0.0.3",
+  "description": "模拟逐格温度、湿度、日照和四季；按气候生成群系、降雨、雷暴与飓风。",
+  "GUID": "WB.CLIMATE.WEATHER"
+}

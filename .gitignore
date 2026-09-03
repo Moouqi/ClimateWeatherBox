@@ -1,0 +1,11 @@
+# Build outputs
+bin/
+obj/
+
+# Game source reference (local only)
+.GameSource/
+
+# IDE
+.vs/
+.idea/
+*.user
