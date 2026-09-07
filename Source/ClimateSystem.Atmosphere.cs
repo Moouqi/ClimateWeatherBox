@@ -29,8 +29,7 @@ public sealed partial class ClimateSystem
 
     private int AirIndex(int x, int y)
     {
-        if (_longitudeMaxDegrees - _longitudeMinDegrees >= 359f)
-            x = (x % _airWidth + _airWidth) % _airWidth;
+        if (HorizontalWrap) x = HorizontalTopology.Wrap(x, _airWidth);
         return Mathf.Clamp(y, 0, _airHeight - 1) * _airWidth + Mathf.Clamp(x, 0, _airWidth - 1);
     }
 
@@ -178,7 +177,7 @@ public sealed partial class ClimateSystem
 
     private int AirTransportIndex(int x, int y)
     {
-        bool global = _longitudeMaxDegrees - _longitudeMinDegrees >= 359f;
+        bool global = HorizontalWrap;
         if ((!global && (x < 0 || x >= _airWidth)) ||
             (y < 0 && _latitudeMinDegrees > -89.9f) ||
             (y >= _airHeight && _latitudeMaxDegrees < 89.9f)) return -1;

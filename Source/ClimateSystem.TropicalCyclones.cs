@@ -117,8 +117,10 @@ public sealed partial class ClimateSystem
         foreach (TornadoEffect active in _activeTropicalCyclones)
         {
             WorldTile center = active == null ? null : active.current_tile ?? active.tile;
-            if (center != null && Vector2.Distance(new Vector2(center.pos.x, center.pos.y),
-                new Vector2(tile.pos.x, tile.pos.y)) < AtmosphereStride * 8) return;
+            if (center == null) continue;
+            float dx=HorizontalWrap ? HorizontalTopology.Delta(center.x,tile.x,MapBox.width) : tile.x-center.x;
+            float dy=tile.y-center.y;
+            if (dx*dx+dy*dy < AtmosphereStride*AtmosphereStride*64) return;
         }
         float seasonalBoost = Mathf.Lerp(0.72f, 1.38f, LocalSummerStrength(tile));
         float chance = 1f - Mathf.Exp(-0.18f * potential * potential * seasonalBoost *
@@ -195,7 +197,7 @@ public sealed partial class ClimateSystem
 
     private Vector2 WindAt(int x, int y)
     {
-        if (x < 0 || y < 0 || x >= MapBox.width || y >= MapBox.height) return Vector2.zero;
+        if (!HorizontalTopology.NormalizeCell(ref x,y,MapBox.width,MapBox.height,HorizontalWrap)) return Vector2.zero;
         int pixel = y * MapBox.width + x;
         if (pixel < 0 || pixel >= _cellIndexByPixel.Length) return Vector2.zero;
         int index = _cellIndexByPixel[pixel];
@@ -342,7 +344,8 @@ public sealed partial class ClimateSystem
         {
             if (dx == 0 && dy == 0) continue;
             Vector2 direction = new Vector2(dx, dy).normalized;
-            int x = Mathf.Clamp(tile.pos.x + dx * 7, 0, MapBox.width - 1);
+            int x = tile.pos.x + dx * 7;
+            x=HorizontalWrap ? HorizontalTopology.Wrap(x,MapBox.width) : Mathf.Clamp(x,0,MapBox.width-1);
             int y = Mathf.Clamp(tile.pos.y + dy * 7, 0, MapBox.height - 1);
             WorldTile candidate = MapBox.instance.GetTileSimple(x, y);
             if (candidate == null || !TryGetClimate(candidate, out ClimateCell candidateCell)) continue;
@@ -372,6 +375,19 @@ public sealed partial class ClimateSystem
                 MapBox.spawnLightningSmall(tile, 0.18f + state.Intensity * 0.18f, null);
                 _stormEvents++;
             }
+        }
+        if (HorizontalWrap)
+        {
+            var visited=new System.Collections.Generic.HashSet<int> { tile.y*MapBox.width+tile.x };
+            for (int oy=-1;oy<=1;oy++)
+            for (int ox=-1;ox<=1;ox++)
+            {
+                int x=tile.x+ox,y=tile.y+oy;
+                if (!HorizontalTopology.NormalizeCell(ref x,y,MapBox.width,MapBox.height,true) ||
+                    !visited.Add(y*MapBox.width+x)) continue;
+                AddGroundMoisture(World.world.GetTileSimple(x,y),Mathf.Lerp(0.008f,0.022f,state.Intensity));
+            }
+            return;
         }
         if (tile.neighbours == null) return;
         for (int i = 0; i < tile.neighbours.Length; i++)

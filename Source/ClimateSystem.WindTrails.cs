@@ -9,10 +9,13 @@ public sealed partial class ClimateSystem
     private readonly Vector2[,] _windParticleHistory = new Vector2[WindParticleCount, 6];
     private readonly float[] _windParticleLife = new float[WindParticleCount];
     private float _windParticleTime;
+    private int _windParticleFrame = -1;
 
-    private void DrawWindTrails(Camera camera, Rect rect)
+    private void AdvanceWindTrails()
     {
         if (!AtmosphereReady || Event.current.type != EventType.Repaint) return;
+        if (_windParticleFrame == Time.frameCount) return;
+        _windParticleFrame = Time.frameCount;
         float dt = Mathf.Clamp(_seasonClock - _windParticleTime, 0f, 0.10f);
         _windParticleTime = _seasonClock;
         for (int i = 0; i < WindParticleCount; i++)
@@ -33,9 +36,26 @@ public sealed partial class ClimateSystem
                 _windParticleHistory[i, 0] = p;
                 Vector2 midpoint = p + v * dt * 4f;
                 p += SampleAir(midpoint.x, midpoint.y).Velocity * dt * 8f;
+                if (HorizontalWrap && (p.x < 0f || p.x >= MapBox.width))
+                {
+                    p.x = HorizontalTopology.Wrap(p.x, MapBox.width);
+                    // Do not draw a spurious line across the whole map at a seam.
+                    for (int j = 0; j < 6; j++) _windParticleHistory[i, j] = p;
+                }
                 _windParticleLife[i] -= dt * (v.sqrMagnitude < 0.001f ? 4f : 1f);
             }
             _windParticlePositions[i] = p;
+        }
+    }
+
+    private void DrawWindTrails(Camera camera, Rect rect)
+    {
+        if (!AtmosphereReady || Event.current.type != EventType.Repaint) return;
+        AdvanceWindTrails();
+        for (int i = 0; i < WindParticleCount; i++)
+        {
+            Vector2 p = _windParticlePositions[i];
+            Vector2 v = SampleAir(p.x,p.y).Velocity;
             Vector2 previous = p;
             for (int j = 0; j < 6; j++)
             {

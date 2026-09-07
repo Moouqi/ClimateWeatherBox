@@ -11,6 +11,8 @@ public sealed class ModClass : BasicMod<ModClass>
     {
         gameObject.AddComponent<GpuCapabilityProbe>();
         _climate = gameObject.AddComponent<ClimateSystem>();
+        gameObject.AddComponent<HorizontalSeamPreview>();
+        gameObject.AddComponent<HorizontalCameraWrap>();
         new Harmony("WB.CLIMATE.WEATHER").PatchAll();
     }
 }

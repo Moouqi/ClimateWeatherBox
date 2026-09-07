@@ -37,7 +37,7 @@ public sealed partial class ClimateSystem
             {
                 int nx = x + dx[direction];
                 int ny = y + dy[direction];
-                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                if (!HorizontalTopology.NormalizeCell(ref nx,ny,width,height,HorizontalWrap)) continue;
                 int nextPixel = ny * width + nx;
                 if (waterDistance[nextPixel] <= nextDistance) continue;
                 int nextIndex = _cellIndexByPixel[nextPixel];
@@ -79,7 +79,7 @@ public sealed partial class ClimateSystem
                 int other = acceptedSources[i];
                 int ox = other % width;
                 int oy = other / width;
-                int ddx = sx - ox;
+                float ddx = HorizontalWrap ? HorizontalTopology.Delta(sx,ox,width) : sx-ox;
                 int ddy = sy - oy;
                 if (ddx * ddx + ddy * ddy < sourceSpacing * sourceSpacing)
                 {
@@ -107,6 +107,7 @@ public sealed partial class ClimateSystem
         int[] dy = { 0, 0, -1, 1 };
         Queue<int> componentFrontier = new Queue<int>();
         List<int> component = new List<int>();
+        HashSet<int> occupiedColumns = new HashSet<int>();
 
         for (int startPixel = 0; startPixel < total; startPixel++)
         {
@@ -119,6 +120,7 @@ public sealed partial class ClimateSystem
                 continue;
             }
             component.Clear();
+            occupiedColumns.Clear();
             componentFrontier.Enqueue(startPixel);
             visited[startPixel] = true;
             bool hasCloseOrDeepWater = false;
@@ -132,6 +134,7 @@ public sealed partial class ClimateSystem
                 component.Add(pixel);
                 int x = pixel % width;
                 int y = pixel / width;
+                occupiedColumns.Add(x);
                 minX = Math.Min(minX, x);
                 maxX = Math.Max(maxX, x);
                 minY = Math.Min(minY, y);
@@ -146,7 +149,7 @@ public sealed partial class ClimateSystem
                 {
                     int nx = x + dx[direction];
                     int ny = y + dy[direction];
-                    if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                    if (!HorizontalTopology.NormalizeCell(ref nx,ny,width,height,HorizontalWrap)) continue;
                     int nextPixel = ny * width + nx;
                     if (visited[nextPixel]) continue;
                     int nextIndex = _cellIndexByPixel[nextPixel];
@@ -159,6 +162,8 @@ public sealed partial class ClimateSystem
             // 单格水坑和旧版残留浅滩不是湖泊；只有具备实际面积的连通水体
             // 才能成为河流终点。外围海洋和正常湖泊都会远大于此阈值。
             int bodyWidth = maxX - minX + 1;
+            if (HorizontalWrap && minX==0 && maxX==width-1)
+                bodyWidth=HorizontalTopology.CircularColumnSpan(new List<int>(occupiedColumns),width);
             int bodyHeight = maxY - minY + 1;
             float compactness = component.Count / (float)Math.Max(1, bodyWidth * bodyHeight);
             bool broadShallowLake = bodyWidth >= 5 && bodyHeight >= 5 && compactness >= 0.35f;
@@ -189,6 +194,14 @@ public sealed partial class ClimateSystem
         List<int> platformPath = RefineRiverAcrossElevationPlatforms(basePath, tiles, sourcePixel);
         List<int> fourConnected = ConvertRiverToFourNeighbourPath(platformPath, tiles, endpoint);
         if (fourConnected == null || fourConnected.Count < 2) return false;
+        // Fail closed if a refinement ever introduced a jump or uphill step.
+        for (int i=1;i<fourConnected.Count;i++)
+        {
+            int a=fourConnected[i-1],b=fourConnected[i];
+            float dx=HorizontalWrap ? Math.Abs(HorizontalTopology.Delta(a%MapBox.width,b%MapBox.width,MapBox.width))
+                : Math.Abs(a%MapBox.width-b%MapBox.width);
+            if (dx+Math.Abs(a/MapBox.width-b/MapBox.width)!=1 || RiverElevationLevel(b)>RiverElevationLevel(a)) return false;
+        }
 
         // 从河口向水源逆序写入：受分批预算限制时，已经显示的河段仍始终连着水体。
         for (int i = fourConnected.Count - 1; i >= 0; i--)
@@ -219,7 +232,7 @@ public sealed partial class ClimateSystem
             {
                 int nx = x + dx[d];
                 int ny = y + dy[d];
-                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                if (!HorizontalTopology.NormalizeCell(ref nx,ny,width,height,HorizontalWrap)) continue;
                 int pixel = ny * width + nx;
                 if (waterDistance[pixel] >= distance || !IsRiverPassablePixel(pixel, pixel, tiles))
                     continue;
@@ -271,7 +284,7 @@ public sealed partial class ClimateSystem
                 if (ox == 0 && oy == 0) continue;
                 int nx = x + ox;
                 int ny = y + oy;
-                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                if (!HorizontalTopology.NormalizeCell(ref nx,ny,width,height,HorizontalWrap)) continue;
                 int next = ny * width + nx;
                 if (closed.Contains(next) || !IsRiverPassablePixel(next, end, tiles)) continue;
                 int nextLevel = RiverElevationLevel(next);
@@ -360,6 +373,7 @@ public sealed partial class ClimateSystem
         int ax = anchor % width;
         int ay = anchor / width;
         float dx = end % width - start % width;
+        if (HorizontalWrap) dx=HorizontalTopology.Delta(start%width,end%width,width);
         float dy = end / width - start / width;
         float length = Mathf.Max(1f, Mathf.Sqrt(dx * dx + dy * dy));
         float perpendicularX = -dy / length;
@@ -376,7 +390,7 @@ public sealed partial class ClimateSystem
         {
             int x = targetX + ox;
             int y = targetY + oy;
-            if (x < 0 || y < 0 || x >= MapBox.width || y >= MapBox.height) continue;
+            if (!HorizontalTopology.NormalizeCell(ref x,y,MapBox.width,MapBox.height,HorizontalWrap)) continue;
             int pixel = y * width + x;
             if (RiverElevationLevel(pixel) != level || !IsRiverPassablePixel(pixel, end, tiles))
                 continue;
@@ -402,7 +416,8 @@ public sealed partial class ClimateSystem
             int py = previous / MapBox.width;
             int nx = next % MapBox.width;
             int ny = next / MapBox.width;
-            if (Math.Abs(nx - px) == 1 && Math.Abs(ny - py) == 1)
+            float stepX=HorizontalWrap ? Math.Abs(HorizontalTopology.Delta(px,nx,MapBox.width)) : Math.Abs(nx-px);
+            if (stepX == 1 && Math.Abs(ny - py) == 1)
             {
                 int bridgeA = py * MapBox.width + nx;
                 int bridgeB = ny * MapBox.width + px;
@@ -470,10 +485,11 @@ public sealed partial class ClimateSystem
         return Mathf.Clamp(Mathf.FloorToInt(ContourElevationAtPixel(pixel) * 12f) + 1, 1, 12);
     }
 
-    private static float RiverEuclidean(int a, int b)
+    private float RiverEuclidean(int a, int b)
     {
         int width = MapBox.width;
         float dx = a % width - b % width;
+        if (HorizontalWrap) dx=HorizontalTopology.Delta(a%width,b%width,width);
         float dy = a / width - b / width;
         return Mathf.Sqrt(dx * dx + dy * dy);
     }
@@ -700,78 +716,46 @@ public sealed partial class ClimateSystem
     private float GetRiverMoisture(WorldTile tile)
     {
         if (tile == null || tile.main_type?.ocean == true) return 0f;
-        int total = MapBox.width * MapBox.height;
-        bool missingField = _riverMoistureField.Length != total;
-        if (missingField || (_riverMoistureFieldDirty && Time.unscaledTime >= _riverMoistureRebuildAt))
-            BuildRiverMoistureField(World.world?.tiles_list);
         int pixel = tile.pos.y * MapBox.width + tile.pos.x;
         return pixel >= 0 && pixel < _riverMoistureField.Length
             ? _riverMoistureField[pixel]
             : 0f;
     }
 
-    /// <summary>
-    /// 使用双向 chamfer 距离场一次计算全图至浅滩的近似欧式距离。
-    /// 半径扩大到 12 格后，这比每个气候格扫描 25×25 邻域的开销低得多。
-    /// </summary>
-    private void BuildRiverMoistureField(WorldTile[] tiles)
+    private static readonly System.Func<int,int,bool> RiverMoistureSource = IsRiverMoistureSource;
+    private static bool IsRiverMoistureSource(int x,int y)
     {
-        int width = MapBox.width;
-        int height = MapBox.height;
-        int total = width * height;
-        if (tiles == null || width <= 0 || height <= 0 || total <= 0)
-        {
-            _riverMoistureField = Array.Empty<float>();
-            return;
-        }
+        return World.world.GetTileSimple(x,y)?.main_type?.id == "shallow_waters";
+    }
 
-        const float infinity = 100000f;
-        const float diagonalCost = 1.41421356f;
-        if (_riverDistanceBuffer.Length != total) _riverDistanceBuffer = new float[total];
-        float[] distance = _riverDistanceBuffer;
-        for (int pixel = 0; pixel < total; pixel++) distance[pixel] = infinity;
-        for (int i = 0; i < tiles.Length; i++)
+    private void StepRiverMoistureField()
+    {
+        int width=MapBox.width,height=MapBox.height;
+        if (width<=0 || height<=0) return;
+        if (_riverMoistureBuilder == null || _riverMoistureBuilder.Width!=width ||
+            _riverMoistureBuilder.Height!=height || _riverMoistureBuilder.Wrap!=HorizontalWrap)
         {
-            WorldTile water = tiles[i];
-            if (water?.main_type?.id != "shallow_waters") continue;
-            int pixel = water.pos.y * width + water.pos.x;
-            if (pixel >= 0 && pixel < total) distance[pixel] = 0f;
+            _riverMoistureBuilder=new RiverMoistureBuilder(width,height,RiverMoistureRadius,HorizontalWrap);
+            _riverMoistureFieldDirty=true;
         }
-
-        for (int y = 0; y < height; y++)
-        for (int x = 0; x < width; x++)
+        var builder=_riverMoistureBuilder;
+        if (builder.Complete)
         {
-            int pixel = y * width + x;
-            float best = distance[pixel];
-            if (x > 0) best = Mathf.Min(best, distance[pixel - 1] + 1f);
-            if (y > 0) best = Mathf.Min(best, distance[pixel - width] + 1f);
-            if (x > 0 && y > 0) best = Mathf.Min(best, distance[pixel - width - 1] + diagonalCost);
-            if (x + 1 < width && y > 0)
-                best = Mathf.Min(best, distance[pixel - width + 1] + diagonalCost);
-            distance[pixel] = best;
+            if (!_riverMoistureFieldDirty || Time.unscaledTime<_riverMoistureRebuildAt) return;
+            // Changes arriving during this build set dirty again and queue another
+            // build; publication must never erase that pending invalidation.
+            _riverMoistureFieldDirty=false;
+            builder.Begin();
         }
-        for (int y = height - 1; y >= 0; y--)
-        for (int x = width - 1; x >= 0; x--)
+        long start=System.Diagnostics.Stopwatch.GetTimestamp();
+        for (int work=0;work<32768 && !builder.Complete;work+=1024)
         {
-            int pixel = y * width + x;
-            float best = distance[pixel];
-            if (x + 1 < width) best = Mathf.Min(best, distance[pixel + 1] + 1f);
-            if (y + 1 < height) best = Mathf.Min(best, distance[pixel + width] + 1f);
-            if (x + 1 < width && y + 1 < height)
-                best = Mathf.Min(best, distance[pixel + width + 1] + diagonalCost);
-            if (x > 0 && y + 1 < height)
-                best = Mathf.Min(best, distance[pixel + width - 1] + diagonalCost);
-            distance[pixel] = best;
+            builder.Step(1024,RiverMoistureSource);
+            if ((System.Diagnostics.Stopwatch.GetTimestamp()-start)*1000.0/System.Diagnostics.Stopwatch.Frequency>=1.0) break;
         }
-
-        if (_riverMoistureField.Length != total) _riverMoistureField = new float[total];
-        for (int pixel = 0; pixel < total; pixel++)
-        {
-            float d = distance[pixel];
-            _riverMoistureField[pixel] = d <= RiverMoistureRadius
-                ? (1f - d / (RiverMoistureRadius + 0.5f)) * 0.34f
-                : 0f;
-        }
-        _riverMoistureFieldDirty = false;
+        if (!builder.Complete) return;
+        float[] old=_riverMoistureField;
+        _riverMoistureField=builder.Result;
+        builder.RecycleOutput(old);
     }
 }

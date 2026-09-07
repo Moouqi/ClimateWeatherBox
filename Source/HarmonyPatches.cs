@@ -46,6 +46,7 @@ internal static class LocalCloudWindPatch
         float shadowOffsetY = cloud.spriteShadow == null ? 0f : cloud.spriteShadow.offset.y;
         int x = Mathf.FloorToInt(position.x);
         int y = Mathf.FloorToInt(position.y + shadowOffsetY);
+        if (ClimateSystem.Active?.HorizontalWrap == true) x = HorizontalTopology.Wrap(x, MapBox.width);
         if (x < 0 || x >= MapBox.width || y < 0 || y >= MapBox.height) return null;
         return MapBox.instance.GetTileSimple(x, y);
     }
@@ -87,6 +88,13 @@ internal static class LocalCloudWindPatch
             wind.y * __state.OriginalSpeed * pElapsed,
             0f);
 
+        if (climate.HorizontalWrap)
+        {
+            Vector3 wrapped = __instance.transform.localPosition;
+            wrapped.x = HorizontalTopology.Wrap(wrapped.x, MapBox.width);
+            __instance.transform.localPosition = wrapped;
+        }
+
         WorldTile landingTile = TileUnderCloud(__instance) ?? tile;
         __instance.current_tile = landingTile;
         __instance.tile = landingTile;
@@ -110,8 +118,9 @@ internal static class LocalCloudWindPatch
         float mapY = position.y + shadowOffsetY;
         // 从地图外生成的原版云可首次进入；已经进入过的云越界后不可恢复原版 +X
         // 位移再次弹回，否则逆风边界会形成永不回收的云堆。
+        bool wrap = ClimateSystem.Active?.HorizontalWrap == true;
         bool outside = __state.Motion?.EnteredMap == true &&
-                       (position.x < 0f || position.x >= MapBox.width ||
+                       ((!wrap && (position.x < 0f || position.x >= MapBox.width)) ||
                         mapY < 0f || mapY >= MapBox.height);
         bool stuck = false;
         bool overstayed = false;
@@ -121,7 +130,9 @@ internal static class LocalCloudWindPatch
             Vector2 current = new Vector2(position.x, mapY);
             if (motion.HasLastPosition)
             {
-                float moved = Vector2.Distance(current, motion.LastPosition);
+                float dx = wrap ? HorizontalTopology.Delta(motion.LastPosition.x, current.x, MapBox.width)
+                    : current.x - motion.LastPosition.x;
+                float moved = new Vector2(dx, current.y - motion.LastPosition.y).magnitude;
                 // 阈值仅为正常速度的 1.5%，山峰绕流即使降至约 10% 仍会被视为移动。
                 float minimumProgress = Mathf.Max(0.0005f,
                     Mathf.Abs(__state.OriginalSpeed) * __state.Elapsed * 0.015f);
@@ -154,14 +165,51 @@ internal static class LocalTornadoWindPatch
     private static readonly AccessTools.FieldRef<TornadoEffect, WorldTile> TargetTile =
         AccessTools.FieldRefAccess<TornadoEffect, WorldTile>("_target_tile");
 
-    private static void Prefix(TornadoEffect __instance)
+    private static bool Prefix(TornadoEffect __instance)
     {
         ClimateSystem climate = ClimateSystem.Active;
+        bool wrap = climate?.HorizontalWrap == true && MapBox.width > 0 && MapBox.height > 0;
+        if (wrap)
+        {
+            Vector3 position=__instance.transform.localPosition;
+            position.x=HorizontalTopology.Wrap(position.x,MapBox.width);
+            position.y=Mathf.Clamp(position.y,0,MapBox.height-1);
+            __instance.transform.localPosition=position;
+            SyncTile(__instance,position);
+        }
         WorldTile tile = __instance?.current_tile ?? __instance?.tile;
         if (climate != null && climate.TryGetTropicalCycloneTarget(__instance, tile, out WorldTile cycloneTarget))
             TargetTile(__instance) = cycloneTarget;
         else if (climate != null && climate.TryGetWindTarget(tile, false, 7, out WorldTile target))
             TargetTile(__instance) = target;
+        if (!wrap || tile == null) return true;
+        WorldTile destination=TargetTile(__instance);
+        if (destination == null || destination == tile)
+        {
+            int x=HorizontalTopology.Wrap(tile.x+UnityEngine.Random.Range(-5,6),MapBox.width);
+            int y=Mathf.Clamp(tile.y+UnityEngine.Random.Range(-5,6),0,MapBox.height-1);
+            destination=World.world.GetTileSimple(x,y);
+            TargetTile(__instance)=destination;
+        }
+        Vector3 p=__instance.transform.localPosition;
+        Vector3 delta=destination.posV3-p;
+        delta.x=HorizontalTopology.Delta(p.x,destination.x,MapBox.width);
+        // Preserve the original per-update speed; only topology is changed.
+        p+=delta.normalized*0.15f;
+        p.x=HorizontalTopology.Wrap(p.x,MapBox.width);
+        p.y=Mathf.Clamp(p.y,0,MapBox.height-1);
+        __instance.transform.localPosition=p;
+        SyncTile(__instance,p);
+        return false;
+    }
+
+    private static void SyncTile(TornadoEffect effect,Vector3 position)
+    {
+        WorldTile tile=World.world.GetTileSimple(Mathf.FloorToInt(position.x),Mathf.FloorToInt(position.y));
+        if (tile == null || tile == effect.current_tile) return;
+        if (effect.current_tile != null) effect.removeTornadoFromTile();
+        effect.current_tile=tile;
+        effect.addTornadoToTile();
     }
 }
 

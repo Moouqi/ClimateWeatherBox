@@ -131,7 +131,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private string _riverButtonStatus = "生成河流";
     private float _riverButtonStatusUntil;
     private float[] _riverMoistureField = Array.Empty<float>();
-    private float[] _riverDistanceBuffer = Array.Empty<float>();
+    private RiverMoistureBuilder _riverMoistureBuilder;
     private bool _riverMoistureFieldDirty = true;
     private float _riverMoistureRebuildAt;
 
@@ -198,6 +198,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         RefreshAgeClimateProfileIfNeeded();
         ProcessTerrainChanges();
         TryStartAutomaticRiverGeneration();
+        StepRiverMoistureField();
         if (World.world.isPaused()) return;
         _seasonClock += Time.deltaTime;
         AdvanceContinuousAtmosphere();
@@ -270,7 +271,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         _riverAppliedTiles = 0;
         _riverSkippedTiles = 0;
         _riverMoistureField = Array.Empty<float>();
-        _riverDistanceBuffer = Array.Empty<float>();
+        _riverMoistureBuilder = null;
         _riverMoistureFieldDirty = true;
         _riverMoistureRebuildAt = 0f;
         RefreshAgeClimateProfileIfNeeded(true);
@@ -726,9 +727,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
         CalculateSolarTemperature(tile, noise, isOcean, cell.Humidity,
             out float sunlight, out float targetTemperature);
         int oceanNeighbours = 0;
-        if (!isOcean && tile.neighbours != null)
-            for (int i = 0; i < tile.neighbours.Length; i++)
-                if (tile.neighbours[i]?.Type != null && tile.neighbours[i].Type.layer_type == TileLayerType.Ocean)
+        if (!isOcean)
+            for (int i = 0; i < ClimateNeighbourCount(tile); i++)
+                if (ClimateNeighbour(tile,i)?.Type?.layer_type == TileLayerType.Ocean)
                     oceanNeighbours++;
         float coastMoisture = Mathf.Clamp01(oceanNeighbours * 0.16f);
         float riverMoisture = GetRiverMoisture(tile);
@@ -813,9 +814,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (elapsed <= 0f) return;
 
         int waterNeighbours = 0;
-        if (tile.neighbours != null)
-            for (int i = 0; i < tile.neighbours.Length; i++)
-                if (tile.neighbours[i]?.Type?.ocean == true) waterNeighbours++;
+        for (int i = 0; i < ClimateNeighbourCount(tile); i++)
+            if (ClimateNeighbour(tile,i)?.Type?.ocean == true) waterNeighbours++;
 
         // 冷空气、夜晚、高湿和邻水都会加速散热；炎热干燥的白昼岩浆冷却最慢。
         float coolingRate = 0.42f + (1f - cell.Temperature) * 1.15f +
@@ -897,7 +897,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
             temperature = Mathf.Max(temperature, 0.78f + Mathf.Clamp(tile.Type.lava_level, 0, 3) * 0.065f);
     }
 
-    private static float GetDiurnalAmplitudeC(WorldTile tile, bool isOcean, float humidity)
+    private float GetDiurnalAmplitudeC(WorldTile tile, bool isOcean, float humidity)
     {
         if (isOcean)
         {
@@ -1566,10 +1566,11 @@ public sealed partial class ClimateSystem : MonoBehaviour
         return Mathf.Clamp(summerFactor * rainSeasonFactor, 0.55f, 1.75f);
     }
 
-    private static WorldTile NearbyWeatherTile(WorldTile center, int radius)
+    private WorldTile NearbyWeatherTile(WorldTile center, int radius)
     {
         if (center == null || radius <= 0) return center;
-        int x = Mathf.Clamp(center.pos.x + UnityEngine.Random.Range(-radius, radius + 1), 0, MapBox.width - 1);
+        int x = center.pos.x + UnityEngine.Random.Range(-radius, radius + 1);
+        x=HorizontalWrap ? HorizontalTopology.Wrap(x,MapBox.width) : Mathf.Clamp(x,0,MapBox.width-1);
         int y = Mathf.Clamp(center.pos.y + UnityEngine.Random.Range(-radius, radius + 1), 0, MapBox.height - 1);
         return MapBox.instance.GetTileSimple(x, y) ?? center;
     }
@@ -1634,9 +1635,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
         state.NextMoistureTime = Time.time + 1.5f;
 
         AddGroundMoisture(landingTile, 0.040f);
-        if (landingTile.neighbours == null) return;
-        for (int i = 0; i < landingTile.neighbours.Length; i++)
-            AddGroundMoisture(landingTile.neighbours[i], 0.018f);
+        for (int i = 0; i < ClimateNeighbourCount(landingTile); i++)
+            AddGroundMoisture(ClimateNeighbour(landingTile,i), 0.018f);
     }
 
     private void AddGroundMoisture(WorldTile tile, float amount)
@@ -1650,13 +1650,13 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (_visibleLayer == ClimateLayer.Humidity) MarkLayerDirty(tile);
     }
 
-    private static bool IsCoastal(WorldTile tile)
+    private bool IsCoastal(WorldTile tile)
     {
-        if (tile?.neighbours == null) return false;
+        if (tile == null) return false;
         bool land = tile.Type != null && tile.Type.layer_type != TileLayerType.Ocean;
-        for (int i = 0; i < tile.neighbours.Length; i++)
+        for (int i = 0; i < ClimateNeighbourCount(tile); i++)
         {
-            WorldTile n = tile.neighbours[i];
+            WorldTile n = ClimateNeighbour(tile,i);
             if (n?.Type == null) continue;
             if ((n.Type.layer_type == TileLayerType.Ocean) == land) return true;
         }
@@ -1992,7 +1992,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
     {
         target = null;
         if (!TryGetClimate(tile, out ClimateCell cell) || cell.Wind.sqrMagnitude < 0.001f) return false;
-        int x = Mathf.Clamp(Mathf.RoundToInt(tile.pos.x + cell.Wind.x * distance), 0, MapBox.width - 1);
+        int x = Mathf.RoundToInt(tile.pos.x + cell.Wind.x * distance);
+        x=HorizontalWrap && !waterOnly ? HorizontalTopology.Wrap(x,MapBox.width) : Mathf.Clamp(x,0,MapBox.width-1);
         int y = Mathf.Clamp(Mathf.RoundToInt(tile.pos.y + cell.Wind.y * distance), 0, MapBox.height - 1);
         WorldTile candidate = MapBox.instance.GetTileSimple(x, y);
         if (candidate == null) return false;
@@ -2022,9 +2023,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
         WorldTile barrier = null;
         for (int distance = 1; distance <= 3; distance++)
         {
-            int x = Mathf.Clamp(Mathf.RoundToInt(tile.pos.x + direction.x * distance), 0, MapBox.width - 1);
-            int y = Mathf.Clamp(Mathf.RoundToInt(tile.pos.y + direction.y * distance), 0, MapBox.height - 1);
-            WorldTile candidate = MapBox.instance.GetTileSimple(x, y);
+            int x = Mathf.RoundToInt(tile.pos.x + direction.x * distance);
+            int y = Mathf.RoundToInt(tile.pos.y + direction.y * distance);
+            WorldTile candidate = CloudTerrainSample(x, y);
             if (IsSummit(candidate)) { barrier = candidate; break; }
         }
         if (barrier == null) return baseWind;
@@ -2032,12 +2033,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
         // 山峰在云的下风方时，比较左右两条绕行路径，选择较低一侧。
         Vector2 left = new Vector2(-direction.y, direction.x);
         Vector2 right = -left;
-        WorldTile leftTile = MapBox.instance.GetTileSimple(
-            Mathf.Clamp(Mathf.RoundToInt(tile.pos.x + left.x * 2f), 0, MapBox.width - 1),
-            Mathf.Clamp(Mathf.RoundToInt(tile.pos.y + left.y * 2f), 0, MapBox.height - 1));
-        WorldTile rightTile = MapBox.instance.GetTileSimple(
-            Mathf.Clamp(Mathf.RoundToInt(tile.pos.x + right.x * 2f), 0, MapBox.width - 1),
-            Mathf.Clamp(Mathf.RoundToInt(tile.pos.y + right.y * 2f), 0, MapBox.height - 1));
+        WorldTile leftTile = CloudTerrainSample(
+            Mathf.RoundToInt(tile.pos.x + left.x * 2f),Mathf.RoundToInt(tile.pos.y + left.y * 2f));
+        WorldTile rightTile = CloudTerrainSample(
+            Mathf.RoundToInt(tile.pos.x + right.x * 2f),Mathf.RoundToInt(tile.pos.y + right.y * 2f));
         float leftElevation = GetTerrainElevation(leftTile);
         float rightElevation = GetTerrainElevation(rightTile);
         Vector2 detour = leftElevation <= rightElevation ? left : right;
@@ -2061,9 +2060,16 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (_cells.Length == 0) return;
         // WorldBox 的滚动/模态窗口由独立 Canvas 绘制；本模组的 OnGUI 层级在其后。
         // 任意窗口打开时暂停全部覆盖层，避免夜幕、图层和提示框压暗弹窗。
-        if (ScrollWindow.isWindowActive()) return;
+        if (ClimateUiLayout.NativePopupVisible) return;
         DrawClimateOverlay();
         if (!_showPanel) return;
+        Matrix4x4 previousMatrix=GUI.matrix;
+        GUI.BeginGroup(ClimateUiLayout.Gameplay);
+        float panelScale=ClimateUiLayout.PanelScale;
+        GUI.matrix=Matrix4x4.Scale(new Vector3(panelScale,panelScale,1));
+        try
+        {
+        GUI.depth = -10;
         RefreshClimateAverages();
         string season = SeasonName();
         GUI.Box(new Rect(8, 80, 285, 550), "气候与四季 [F8] · " +
@@ -2120,10 +2126,24 @@ public sealed partial class ClimateSystem : MonoBehaviour
         SetLongitudeMaximum(GUI.HorizontalSlider(new Rect(18, 523, 250, 18),
             _longitudeMaxDegrees, _longitudeMinDegrees + 10f, 180f));
         TrackCoordinateSliderInteraction();
+        }
+        finally { GUI.matrix=previousMatrix; GUI.EndGroup(); }
     }
+
+    internal bool IsPointerOnClimatePanel => _showPanel && ClimateUiLayout.PointerInPanel;
 
     private void DrawClimateOverlay()
     {
+        // Window compositor draws these layers with the same clipped projection.
+        if (HorizontalCameraWrap.Active?.Running == true)
+        {
+            if (_visibleLayer != ClimateLayer.None)
+            {
+                GUI.depth = -50;
+                DrawMouseClimateTooltip(Camera.main, HorizontalCameraWrap.Active.MapWindow);
+            }
+            return;
+        }
         Camera camera = Camera.main;
         if (camera == null) return;
 
@@ -2312,8 +2332,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private static Rect GetGameplayViewport()
     {
         // WorldBox 底部工具栏随 UI 缩放变化；按屏幕高度估算并限制上下界。
-        float toolbarHeight = Mathf.Clamp(Screen.height * 0.14f, 110f, 200f);
-        return new Rect(0f, 0f, Screen.width, Mathf.Max(1f, Screen.height - toolbarHeight));
+        return ClimateUiLayout.Gameplay;
     }
 
     private static Rect IntersectRects(Rect a, Rect b)
@@ -2558,6 +2577,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         Vector3 world = camera.ScreenToWorldPoint(mouseScreen);
         int x = Mathf.FloorToInt(world.x);
         int y = Mathf.FloorToInt(world.y);
+        if (HorizontalCameraWrap.Active?.Running == true) x = HorizontalTopology.Wrap(x,MapBox.width);
         if (x < 0 || y < 0 || x >= MapBox.width || y >= MapBox.height) return;
         int pixel = y * MapBox.width + x;
         if (pixel < 0 || pixel >= _cellIndexByPixel.Length) return;
@@ -2600,7 +2620,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
         const float boxWidth = 285f;
         float boxHeight = _visibleLayer == ClimateLayer.Wind ? 152f : 134f;
         float boxX = Mathf.Min(mouseGui.x + 16f, Screen.width - boxWidth - 8f);
-        float boxY = Mathf.Min(mouseGui.y + 18f, Screen.height - boxHeight - 8f);
+        if (ClimateUiLayout.Gameplay.height<boxHeight || ClimateUiLayout.Gameplay.width<boxWidth) return;
+        float boxY = Mathf.Max(0,Mathf.Min(mouseGui.y + 18f, ClimateUiLayout.Gameplay.yMax - boxHeight - 8f));
         GUI.Box(new Rect(boxX, boxY, boxWidth, boxHeight), valueText);
     }
 
