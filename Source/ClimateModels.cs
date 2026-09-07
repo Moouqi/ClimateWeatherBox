@@ -21,6 +21,16 @@ public sealed class ClimateCell
     public float Sunlight;
     public float Temperature;
     public float Humidity;
+    public bool BiomeClimateInitialized;
+    public float BiomeTemperature;
+    public float BiomeMoisture;
+    // Humidity retains the legacy soil-water API used by biomes.
+    public float AirTemperatureC;
+    public float RelativeHumidity;
+    public float RainRate;
+    public float SnowWater;
+    public double LastWaterBalance;
+    public double LastSnowfall;
     public float Pressure;
     public float LastPressureTime = -1f;
     public Vector2 Wind;
@@ -58,6 +68,7 @@ internal sealed class TropicalCycloneState
     public float NextCloudTime;
     public float MaximumLifetime;
     public bool CountedNamedStorm;
+    public bool CountedDepression, CountedStorm, ExitLogged;
 }
 
 internal sealed class VegetationTemperatureState

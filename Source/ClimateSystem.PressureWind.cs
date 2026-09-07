@@ -38,9 +38,9 @@ public sealed partial class ClimateSystem
         // 天气系统范围和振幅略大，大陆受地表摩擦与热力破碎影响更零散。
         float weatherTime = _seasonClock * 0.0024f;
         float synopticNoise = Mathf.PerlinNoise(
-            tile.pos.x * 0.016f + _worldSeed * 0.0017f - weatherTime,
-            tile.pos.y * 0.016f - _worldSeed * 0.0011f + weatherTime * 0.37f) - 0.5f;
-        float synoptic = synopticNoise * (ocean ? 22f : 15f);
+            tile.pos.x * 0.004f + _worldSeed * 0.0017f - weatherTime,
+            tile.pos.y * 0.004f - _worldSeed * 0.0011f + weatherTime * 0.37f) - 0.5f;
+        float synoptic = synopticNoise * (ocean ? 2f : 1.5f);
 
         // 使用相对当地季节常态的温度异常，而非绝对温度，避免把寒冷极地
         // 永久重复计算成超强高压。暖异常形成热低压，冷异常形成冷高压。
@@ -66,8 +66,8 @@ public sealed partial class ClimateSystem
 
         // 湿空气、深厚云层和凝结潜热共同支持低压；幅度保持有限，防止云量
         // 与气压形成不可逆的自激反馈。
-        float moistureLow = -(Mathf.Clamp01(cell.Humidity) - 0.5f) * 4.5f;
-        float cloudLow = -Mathf.Clamp01(cell.CloudCover) * 4f;
+        float moistureLow = 0f;
+        float cloudLow = 0f;
         return Mathf.Clamp(1013.25f + equatorialLow + subtropicalHigh + subpolarLow +
                            polarHigh + synoptic + thermalAnomalyPressure + seasonalLandSea +
                            moistureLow + cloudLow, 968f, 1052f);
@@ -132,6 +132,12 @@ public sealed partial class ClimateSystem
 
     private void CalculateWind(WorldTile tile, ClimateCell cell, bool immediate)
     {
+        if (AtmosphereReady && tile != null && cell != null)
+        {
+            SyncAtmosphere(tile, cell, 0f);
+            if (_visibleLayer == ClimateLayer.Wind) MarkLayerDirty(tile);
+            return;
+        }
         if (tile == null || cell == null || _cellIndexByPixel.Length == 0) return;
         UpdatePressure(tile, cell, immediate);
         float center = cell.Pressure;

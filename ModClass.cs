@@ -19,7 +19,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private const int BiomeChanges = 128;
     private const int BareBiomeScansPerTick = 8192;
     private const int BareBiomeRepairsPerTick = 512;
-    private const float BiomeTransitionDelay = 45f;
+    private const float BiomeTransitionDelay = 90f;
     private const int TerrainChangeCentersPerFrame = 256;
     private const float NightTextureRefreshSeconds = 0.4f;
     private const float RiverMoistureRebuildDelay = 0.35f;
@@ -48,6 +48,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private float _averageTemperature;
     private float _averageLandHumidity;
     private float _nextAverageRefresh;
+    private int _averageCursor, _averageFrame = -1, _averageTemperatureCount, _averageLandCount;
+    private double _averageTemperatureSum, _averageHumiditySum;
     private bool _showPanel = true;
     private ClimateLayer _visibleLayer;
     private ClimateTemplate _template = ClimateTemplate.Global;
@@ -133,7 +135,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private bool _riverMoistureFieldDirty = true;
     private float _riverMoistureRebuildAt;
 
-    private enum ClimateLayer { None, Temperature, Humidity, Wind, Elevation, Clouds }
+    private enum ClimateLayer { None, Temperature, Humidity, Wind, Elevation, Clouds, AirHumidity, Rainfall }
 
     public Season CurrentSeason => (Season)(((int)(_seasonClock / SeasonSeconds)) & 3);
     internal bool OriginalDarkAgeLightingReady => _cells.Length > 0 && _nightTexture != null;
@@ -174,6 +176,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void OnDestroy()
     {
+        _gpuAtmosphere?.Dispose();
         if (Active == this) Active = null;
     }
 
@@ -184,7 +187,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (Input.GetKeyDown(KeyCode.F4)) ToggleLayer(ClimateLayer.Elevation);
         if (Input.GetKeyDown(KeyCode.F5)) ToggleLayer(ClimateLayer.Wind);
         if (Input.GetKeyDown(KeyCode.F6)) ToggleLayer(ClimateLayer.Temperature);
-        if (Input.GetKeyDown(KeyCode.F7)) ToggleLayer(ClimateLayer.Humidity);
+        if (Input.GetKeyDown(KeyCode.F7)) ToggleLayer(
+            _visibleLayer == ClimateLayer.Humidity ? ClimateLayer.AirHumidity :
+            _visibleLayer == ClimateLayer.AirHumidity ? ClimateLayer.Rainfall :
+            _visibleLayer == ClimateLayer.Rainfall ? ClimateLayer.Rainfall : ClimateLayer.Humidity);
         if (World.world == null || World.world.tiles_list == null || World.world.tiles_list.Length == 0) return;
         ApplyPendingCoordinateRange();
         if (!EnsureWorld()) return;
@@ -194,6 +200,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         TryStartAutomaticRiverGeneration();
         if (World.world.isPaused()) return;
         _seasonClock += Time.deltaTime;
+        AdvanceContinuousAtmosphere();
         UpdateTropicalCyclones();
         _solarTick += Time.deltaTime;
         if (_solarTick >= SolarTickSeconds)
@@ -227,11 +234,15 @@ public sealed partial class ClimateSystem : MonoBehaviour
         CreateFrozenSeaTilemaps();
         RepairInvalidOceanSnow(tiles);
 
+        _gpuAtmosphere?.Dispose(); _gpuAtmosphere = null;
+        _air = Array.Empty<AirState>();
         _cursor = 0;
         _solarCursor = 0;
         _bareBiomeCursor = 0;
         _seasonClock = 0f;
         _nextAverageRefresh = 0f;
+        _averageCursor = 0;
+        _averageFrame = -1;
         _currentAgeId = string.Empty;
         _ageClimateProfile = AgeClimateProfile.Normal;
         _climateFrozenTiles.Clear();
@@ -285,6 +296,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         BuildClimateTraversalOrder();
         for (int i = 0; i < tiles.Length; i++) UpdatePressure(tiles[i], initialized[i], true);
         for (int i = 0; i < tiles.Length; i++) CalculateWind(tiles[i], initialized[i], true);
+        InitializeContinuousAtmosphere();
         BuildLayerRenderer();
         RefreshLayer();
         RefreshClimateAverages(true);
@@ -518,8 +530,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
             return;
         }
         // 按离赤道的距离排序，使气候地形刷新由赤道向两极推进。
-        // 给同纬度地块加入少量确定性抖动，避免批次边缘形成整行条带。
-        float featherRows = Mathf.Clamp(MapBox.height * 0.025f, 3f, 10f);
+        // 在约6°宽的纬度带内按小片区交错推进，避免整排完成造成直线前沿。
+        const float featherDegrees = 6f;
         List<KeyValuePair<float, int>> ranked = new List<KeyValuePair<float, int>>(total);
         for (int y = 0; y < MapBox.height; y++)
         for (int x = 0; x < MapBox.width; x++)
@@ -527,8 +539,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
             int pixel = y * MapBox.width + x;
             int index = _cellIndexByPixel[pixel];
             if (index < 0) continue;
-            float equatorDistance = Mathf.Abs(LatitudeDegreesAt(y)) / 180f * MapBox.height;
-            float jitter = TraversalJitter01(x, y) * featherRows;
+            float equatorDistance = Mathf.Abs(LatitudeDegreesAt(y));
+            float jitter = TraversalJitter01(x / 4, y / 4) * featherDegrees +
+                           TraversalJitter01(x, y) * 0.35f;
             ranked.Add(new KeyValuePair<float, int>(equatorDistance + jitter, index));
         }
         ranked.Sort((a, b) =>
@@ -703,6 +716,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private void CalculateCell(WorldTile tile, ClimateCell cell, bool initializeTemperature,
         bool immediateClimate)
     {
+        if (AtmosphereReady && !initializeTemperature) return;
         // signedLatitude: 0 = 赤道，+1 = 北极，-1 = 南极。
         float signedLatitude = GetSignedLatitude(tile.pos.y);
         float latitude = Mathf.Abs(signedLatitude);
@@ -951,22 +965,24 @@ public sealed partial class ClimateSystem : MonoBehaviour
             float thermalTime = GetThermalTimeSeconds(tile, ocean, cell.Humidity,
                 targetTemperature > cell.Temperature);
             float thermalResponse = 1f - Mathf.Exp(-elapsed / Mathf.Max(1f, thermalTime));
+            if (AtmosphereReady && tile.Type.lava != true)
+            {
+                // Clouds shade the surface by day and moderate cooling at night.
+                targetTemperature += cell.CloudCover * (0.025f - sunlight * 0.07f);
+                targetTemperature = Mathf.Lerp(targetTemperature,
+                    (cell.AirTemperatureC + 50f) / 100f, 0.15f);
+            }
             cell.Temperature = Mathf.Lerp(cell.Temperature, targetTemperature, thermalResponse);
-            UpdatePressure(tile, cell, false);
-            ApplyHighTemperatureLandDrying(tile, cell, elapsed, ocean);
-            UpdateAtmosphericCloudCell(index, tile, cell);
-            if (_visibleLayer == ClimateLayer.Temperature || _visibleLayer == ClimateLayer.Humidity)
+            SyncAtmosphere(tile, cell, elapsed);
+            UpdateBiomeClimateMemory(cell, elapsed);
+            if (_visibleLayer != ClimateLayer.None)
                 MarkLayerDirtyIndex(index, tile);
         }
         _solarCursor = (_solarCursor + count) % tiles.Length;
         // 双缓冲式提交：整轮所有源格完成后再应用 delta，避免数组遍历方向让云团
         // 在同一轮被连续搬运多次而产生固定方向偏差。
-        if (completedPass) ApplyAtmosphericCloudDeltas(tiles);
         // 完成一轮后再提交一次本轮 dirty 像素，避免频繁 GPU 上传造成卡顿。
-        if (completedPass && (_visibleLayer == ClimateLayer.Temperature ||
-                              _visibleLayer == ClimateLayer.Humidity ||
-                              _visibleLayer == ClimateLayer.Clouds ||
-                              _visibleLayer == ClimateLayer.Wind)) RefreshLayer();
+        if (completedPass && _visibleLayer != ClimateLayer.None) RefreshLayer();
     }
 
     /// <summary>
@@ -1450,7 +1466,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
             float cloudHumidityThreshold = ocean ? 0.46f :
                 Mathf.Lerp(0.52f, 0.38f, landEvapotranspiration);
             cloudHumidityThreshold -= atmosphericCloud * 0.08f;
-            if (c.Humidity > cloudHumidityThreshold && atmosphericCloud > 0.12f &&
+            if (c.RainRate > 0.00001f && atmosphericCloud > 0.12f &&
                 UnityEngine.Random.value < rainChance)
             {
                 int cloudCount = ocean ? 2 : 1;
@@ -1480,8 +1496,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
                 // ApplyRainfallMoisture 回补目的地，形成可追踪的水循环。
                 float sourceMoistureCost = ocean ? 0.012f :
                     Mathf.Lerp(0.018f, 0.030f, landEvapotranspiration);
-                c.Humidity = Mathf.Max(0f, c.Humidity - cloudCount * sourceMoistureCost);
-                c.CloudCover = Mathf.Max(0f, c.CloudCover - cloudCount * 0.025f);
+                // Visible clouds represent precipitation already accounted for by the atmosphere.
                 if (_visibleLayer == ClimateLayer.Clouds) MarkLayerDirtyIndex(index, tile);
             }
             if (c.Humidity > 0.68f && c.Temperature > 0.48f &&
@@ -1490,8 +1505,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
                 MapBox.spawnLightningSmall(tile, 0.2f + convection * 0.18f, null);
                 _stormEvents++;
             }
-            TrySpawnPressureDrivenSevereWeather(tile, c, tiles.Length, convection);
         }
+        CheckSevereWeatherCandidates(tiles);
     }
 
     private float LandEvapotranspirationPotential(WorldTile tile, ClimateCell cell,
@@ -1612,6 +1627,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     internal void ApplyRainfallMoisture(Cloud cloud, WorldTile landingTile)
     {
+        if (AtmosphereReady) return; // Continuous precipitation owns the water budget.
         if (cloud == null || landingTile == null ||
             !_rainCloudStates.TryGetValue(cloud, out RainCloudState state) ||
             Time.time < state.NextMoistureTime) return;
@@ -1661,7 +1677,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
             return false;
         // 自然扩张只允许写入当前气候真正选中的群系。宽容区仅用于已经写入的
         // 群系防抖，不能作为继续向外扩张的许可，否则群系会越过气候边界。
-        return SelectBiome(tile, temperature, humidity) == biomeId;
+        return IsBiomeWithinTolerance(tile, biomeId, temperature, humidity) &&
+               SelectBiome(tile, temperature, humidity) == biomeId;
     }
 
     internal void AcceptExternalBiomeExpansion(WorldTile tile, string biomeId)
@@ -1698,7 +1715,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (!seedableBareSoil &&
             _acceptedBiomeExpansions.TryGetValue(tileId, out string acceptedBiome))
         {
-            if (acceptedBiome == current && IsBiomeWithinTolerance(
+            if (acceptedBiome == current && SelectBiome(tile, c.Temperature, c.Humidity) == current && IsBiomeWithinTolerance(
                     tile, current, c.Temperature, c.Humidity) &&
                 HasExpectedBiomeTerrainVariant(tile, current))
             {
@@ -1771,7 +1788,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     }
 
     /// <summary>
-    /// 裸土不使用普通群系的 45 秒防抖队列。优先处理地形变更登记的格点，随后用
+    /// 裸土不使用普通群系的 90 秒防抖队列。优先处理地形变更登记的格点，随后用
     /// 独立游标按气候遍历顺序（赤道到两极）扫描全图，确保遗漏的裸土也会被修复。
     /// </summary>
     private void RepairBareBiomeTiles(WorldTile[] tiles)
@@ -1923,83 +1940,40 @@ public sealed partial class ClimateSystem : MonoBehaviour
         return expected != null && tile.top_type?.id == expected.id;
     }
 
-    private bool IsBiomeWithinTolerance(WorldTile tile, string biomeId, float t, float h)
-    {
-        // 该宽容范围只用于限制原版/外部群系扩张，不参与气候系统自身的目标选择。
-        // 气候转换由 SelectBiome 的核心条件和 45 秒候选稳定时间防抖，避免宽容区
-        // 与其他群系核心区重叠后把草原、沙漠永久锁死。
-        float c = ClimateCelsius(t);
-        float latitude = tile == null ? 0f : Mathf.Abs(GetSignedLatitude(tile.pos.y));
-        bool alpine = IsSummit(tile);
-        switch (biomeId)
-        {
-            case "biome_permafrost": return c < 2f && (latitude >= 0.56f || alpine);
-            case "biome_desert": return h < 0.18f ||
-                (c >= 2f && h < 0.32f) || (c > 15f && h < 0.43f);
-            case "biome_savanna": return latitude <= 0.52f &&
-                c > 14f && c < 38f && h > 0.28f && h < 0.68f;
-            case "biome_swamp": return latitude <= 0.72f &&
-                c > 3f && c < 34f && h > 0.68f;
-            case "biome_jungle": return latitude <= 0.40f &&
-                c > 15f && c < 36f && h > 0.60f;
-            case "biome_maple": return latitude >= 0.15f && latitude <= 0.68f &&
-                c > 4f && c < 30f && h > 0.40f && h < 0.86f;
-            case "biome_birch": return latitude >= 0.32f && latitude <= 0.84f &&
-                c > -8f && c < 20f && h > 0.40f && h < 0.88f;
-            case "biome_grass": return c > -8f && c < 32f && h > 0.20f && h < 0.74f;
-            default: return true;
-        }
-    }
-
-    private string SelectBiome(WorldTile tile, float t, float h)
-    {
-        float c = ClimateCelsius(t);
-        float latitude = tile == null ? 0f : Mathf.Abs(GetSignedLatitude(tile.pos.y));
-        bool alpine = IsSummit(tile);
-        // 纬度为 0–1（赤道0°–极点90°）。极寒低纬只有峰顶可形成高山冻土；
-        // 雨林、稀树草原、枫林和白桦林保留纬度约束，沙漠仅由温湿度决定。
-        // 当前版本没有 biome_forest：原森林气候位由枫林/白桦林覆盖，未命中的
-        // 温带湿润区域按最终回退规则使用草原，避免请求不存在的群系资产。
-        if (c < -5f && (latitude >= 0.61f || alpine)) return "biome_permafrost";
-        bool extremeArid = h < ExtremeDroughtHumidity;
-        if (extremeArid || (c >= 2f && h < 0.24f) || (c >= 18f && h < 0.34f))
-            return "biome_desert";
-        if (latitude <= 0.333f && c >= 18f && h >= 0.68f) return "biome_jungle";
-        if (latitude <= 0.444f && c >= 18f && h < 0.52f) return "biome_savanna";
-        if (latitude <= 0.667f && c >= 7f && h >= 0.78f) return "biome_swamp";
-        if (latitude >= 0.20f && latitude <= 0.61f &&
-            c >= 8f && c < 26f && h >= 0.50f) return "biome_maple";
-        if (latitude >= 0.39f && latitude <= 0.78f &&
-            c >= -2f && c < 16f && h >= 0.50f) return "biome_birch";
-        return "biome_grass";
-    }
 
     private void RefreshClimateAverages(bool force = false)
     {
         if (!force && Time.unscaledTime < _nextAverageRefresh) return;
-        _nextAverageRefresh = Time.unscaledTime + 2f;
+        if (!force && _averageFrame == Time.frameCount) return;
+        _averageFrame = Time.frameCount;
         WorldTile[] tiles = World.world?.tiles_list;
         if (tiles == null || tiles.Length != _cells.Length || _cells.Length == 0) return;
-
-        double temperatureTotal = 0d;
-        double landHumidityTotal = 0d;
-        int temperatureCount = 0;
-        int landCount = 0;
-        for (int i = 0; i < tiles.Length; i++)
+        if (force) _averageCursor = 0;
+        if (_averageCursor == 0)
+        {
+            _averageTemperatureSum = _averageHumiditySum = 0d;
+            _averageTemperatureCount = _averageLandCount = 0;
+        }
+        int end = force ? tiles.Length : Math.Min(tiles.Length, _averageCursor + 16384);
+        for (int i = _averageCursor; i < end; i++)
         {
             WorldTile tile = tiles[i];
             ClimateCell cell = _cells[i];
             if (tile == null || cell == null) continue;
-            temperatureTotal += cell.Temperature;
-            temperatureCount++;
+            _averageTemperatureSum += cell.Temperature;
+            _averageTemperatureCount++;
             bool ocean = tile.main_type?.ocean == true || tile.Type?.layer_type == TileLayerType.Ocean;
             if (ocean) continue;
-            landHumidityTotal += cell.Humidity;
-            landCount++;
+            _averageHumiditySum += cell.Humidity;
+            _averageLandCount++;
         }
 
-        _averageTemperature = temperatureCount > 0 ? (float)(temperatureTotal / temperatureCount) : 0f;
-        _averageLandHumidity = landCount > 0 ? (float)(landHumidityTotal / landCount) : 0f;
+        _averageCursor = end;
+        if (end < tiles.Length) return;
+        _averageTemperature = _averageTemperatureCount > 0 ? (float)(_averageTemperatureSum / _averageTemperatureCount) : 0f;
+        _averageLandHumidity = _averageLandCount > 0 ? (float)(_averageHumiditySum / _averageLandCount) : 0f;
+        _averageCursor = 0;
+        _nextAverageRefresh = Time.unscaledTime + 2f;
     }
 
     internal bool TryGetClimate(WorldTile tile, out ClimateCell cell)
@@ -2092,12 +2066,14 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (!_showPanel) return;
         RefreshClimateAverages();
         string season = SeasonName();
-        GUI.Box(new Rect(8, 80, 285, 475), "气候与四季  [F8]");
+        GUI.Box(new Rect(8, 80, 285, 550), "气候与四季 [F8] · " +
+            (_gpuAtmosphere == null ? "CPU" : _gpuFirstSnapshot ? "GPU" : "GPU启动中"));
         GUI.Label(new Rect(18, 105, 225, 22), $"北半球：{season}  南半球：{OppositeSeasonName()}");
         GUI.Label(new Rect(18, 127, 255, 22), $"平均温度：{FormatTemperature(_averageTemperature)}  陆地湿度：{_averageLandHumidity:P0}");
-        GUI.Label(new Rect(18, 149, 265, 22),
-            $"雨云 {_rainEvents} 雷暴 {_stormEvents} 龙卷 {_tornadoEvents} | " +
-            $"台风 {_typhoonEvents} 飓风 {_hurricaneEvents} 气旋 {_tropicalCycloneEvents}");
+        GUI.Label(new Rect(18, 149, 265, 22), $"累计：雨云 {_rainEvents} 雷暴 {_stormEvents} 龙卷 {_tornadoEvents}");
+        GUI.Label(new Rect(18, 555, 270, 22), $"热带系统：累计生成 {_cycloneTotalEvents} / 当前活跃 {ActiveCycloneCount()}");
+        GUI.Label(new Rect(18, 577, 270, 22), $"阶段去重：低压 {_depressionEvents} / 风暴 {_tropicalStormEvents}");
+        GUI.Label(new Rect(18, 599, 270, 22), $"累计命名：台风 {_typhoonEvents} 飓风 {_hurricaneEvents} 气旋 {_tropicalCycloneEvents}");
         GUI.Label(new Rect(18, 171, 270, 22), $"F3 云 F4 高 F5 风 F6 温 F7 湿  当前：{LayerName()}");
         GUI.Label(new Rect(18, 193, 55, 22), "模板：");
         if (GUI.Button(new Rect(68, 193, 58, 24), TemplateButtonName(ClimateTemplate.NorthernHemisphere)))
@@ -2167,10 +2143,12 @@ public sealed partial class ClimateSystem : MonoBehaviour
         // 所有地图视觉层都限制在操作界面上方。BeginGroup 提供真正的裁剪，
         // 不会压缩纹理或改变地图与纹理之间的坐标对应关系。
         GUI.BeginGroup(gameplayViewport);
-        if ((_visibleLayer == ClimateLayer.Temperature || _visibleLayer == ClimateLayer.Humidity ||
-             _visibleLayer == ClimateLayer.Elevation || _visibleLayer == ClimateLayer.Clouds ||
-             _visibleLayer == ClimateLayer.Wind) &&
-            _layerTexture != null)
+        if (_visibleLayer == ClimateLayer.Wind && AtmosphereReady)
+        {
+            RefreshPressureDisplay(mapRect.width);
+            if (_pressureTexture != null) GUI.DrawTexture(mapRect, _pressureTexture, ScaleMode.StretchToFill, true);
+        }
+        else if (_visibleLayer != ClimateLayer.None && _layerTexture != null)
             GUI.DrawTexture(mapRect, _layerTexture, ScaleMode.StretchToFill, true);
 
         DrawRotatingNight(mapRect);
@@ -2182,7 +2160,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (_visibleLayer == ClimateLayer.Wind)
         {
             DrawWindBeltGuides(mapRect);
-            DrawWindArrows(camera, mapRect);
+            DrawWindTrails(camera, mapRect);
         }
         GUI.EndGroup();
 
@@ -2190,15 +2168,17 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
         // 固定图例，便于确认图层确实开启以及颜色含义。
         Rect legend = new Rect(305, 82, 190, 42);
-        string legendText = _visibleLayer == ClimateLayer.Temperature
+        string legendText = _visibleLayer == ClimateLayer.AirHumidity ? "空气相对湿度：橙（干）→ 蓝（湿）" :
+            _visibleLayer == ClimateLayer.Rainfall ? "降水：橙（无）→ 蓝（强）；F7切换" :
+            _visibleLayer == ClimateLayer.Temperature
             ? "温度：蓝（低）→ 绿 → 红（高）"
             : _visibleLayer == ClimateLayer.Humidity
-                ? "湿度：橙（干）→ 蓝（湿）"
+                ? "土壤湿度：橙（干）→ 蓝（湿）；F7切换"
                 : _visibleLayer == ClimateLayer.Clouds
                     ? "大气云量：透明（少）→ 白（浓密）"
                 : _visibleLayer == ClimateLayer.Elevation
                     ? "等高：蓝（水深）→ 绿（低地）→ 白（峰顶）"
-                    : "气压：蓝（低）→ 红（高）；线为等压线，箭头指向低压";
+                    : "气压：蓝（低）→ 红（高）；流线随风移动";
         GUI.Box(legend, legendText);
         Rect interactiveMapRect = IntersectRects(mapRect, gameplayViewport);
         DrawMouseClimateTooltip(camera, interactiveMapRect);
@@ -2423,11 +2403,11 @@ public sealed partial class ClimateSystem : MonoBehaviour
         foreach (Building building in World.world.buildings)
         {
             if (building == null || building.asset == null || building.current_tile == null) continue;
-            if (!IsNightAt(building.current_tile)) continue;
             BuildingAsset asset = building.asset;
             // 与原版 BatchBuildings/LightRenderer 完全相同的准入字段：
             // draw_light_area=false 的建筑绝不创建透光罩。
             if (!asset.draw_light_area || asset.draw_light_size <= 0f) continue;
+            if (!IsNightAt(building.current_tile)) continue;
             float lightWorldX = building.current_tile.pos.x + 0.5f + asset.draw_light_area_offset_x;
             float lightWorldY = building.current_tile.pos.y + 0.5f + asset.draw_light_area_offset_y;
             int centerX = Mathf.RoundToInt(lightWorldX / Math.Max(1, MapBox.width - 1) * (width - 1));
@@ -2593,7 +2573,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
         string latitudeName = absoluteLatitude < 0.12f ? "赤道" :
             absoluteLatitude > 0.82f ? (signedLatitude > 0f ? "北极圈" : "南极圈") :
             (signedLatitude > 0f ? "北半球" : "南半球");
-        string primary = _visibleLayer == ClimateLayer.Temperature
+        string primary = _visibleLayer == ClimateLayer.AirHumidity ? $"空气相对湿度：{cell.RelativeHumidity:P1}" :
+            _visibleLayer == ClimateLayer.Rainfall ? $"降水强度：{cell.RainRate * 1000f:F2}（模拟单位）" :
+            _visibleLayer == ClimateLayer.Temperature
             ? $"温度：{displayedTemperature}"
             : _visibleLayer == ClimateLayer.Humidity
                 ? $"湿度：{cell.Humidity:P1}"
@@ -2606,7 +2588,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
         bool climateSeaIce = hoveredTile?.main_type?.ocean == true && IsFrozenSeaTop(hoveredTile.top_type);
         bool frozen = hoveredTile?.data?.frozen == true;
         string frozenLabel = climateSeaIce ? "  海冰" : frozen ? "  冰雪" : string.Empty;
-        string valueText = primary + $"\n湿度：{cell.Humidity:P1}  温度：{displayedTemperature}" +
+        string valueText = primary + $"\n土壤：{cell.Humidity:P1}  地温：{displayedTemperature}" +
+                           $"\n空气：{cell.RelativeHumidity:P1}  气温：{cell.AirTemperatureC:F1} °C" +
                            $"\n日照：{cell.Sunlight:P1}  {latitudeName}" +
                            $"\n经纬：{FormatCoordinate(signedLatitude * 90f, true)}  " +
                            $"{FormatCoordinate(longitudeDegrees, false)}" +
@@ -2615,7 +2598,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
                            $"{hoveredTile?.top_type?.id ?? "无"} / " +
                            $"{hoveredTile?.Type?.biome_asset?.id ?? "无"}";
         const float boxWidth = 285f;
-        float boxHeight = _visibleLayer == ClimateLayer.Wind ? 134f : 116f;
+        float boxHeight = _visibleLayer == ClimateLayer.Wind ? 152f : 134f;
         float boxX = Mathf.Min(mouseGui.x + 16f, Screen.width - boxWidth - 8f);
         float boxY = Mathf.Min(mouseGui.y + 18f, Screen.height - boxHeight - 8f);
         GUI.Box(new Rect(boxX, boxY, boxWidth, boxHeight), valueText);
@@ -2671,7 +2654,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (_visibleLayer == ClimateLayer.Elevation) return "等高";
         if (_visibleLayer == ClimateLayer.Wind) return "风向";
         if (_visibleLayer == ClimateLayer.Temperature) return "温度";
-        if (_visibleLayer == ClimateLayer.Humidity) return "湿度";
+        if (_visibleLayer == ClimateLayer.Humidity) return "土壤湿度";
+        if (_visibleLayer == ClimateLayer.AirHumidity) return "空气湿度";
+        if (_visibleLayer == ClimateLayer.Rainfall) return "降水";
         if (_visibleLayer == ClimateLayer.Clouds) return "大气云图";
         return "关闭";
     }
@@ -2681,7 +2666,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         return Mathf.Clamp(Mathf.FloorToInt(ContourElevationAtPixel(pixel) * 12f) + 1, 1, 12);
     }
 
-    private static float WindSpeedKmh(ClimateCell cell) => 5f + cell.WindSpeed * 95f;
+    private static float WindSpeedKmh(ClimateCell cell) => cell.WindSpeed * 100f;
 
     private static string WindDirectionName(Vector2 wind)
     {

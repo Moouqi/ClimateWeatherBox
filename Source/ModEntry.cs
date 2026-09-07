@@ -9,6 +9,7 @@ public sealed class ModClass : BasicMod<ModClass>
 
     protected override void OnModLoad()
     {
+        gameObject.AddComponent<GpuCapabilityProbe>();
         _climate = gameObject.AddComponent<ClimateSystem>();
         new Harmony("WB.CLIMATE.WEATHER").PatchAll();
     }

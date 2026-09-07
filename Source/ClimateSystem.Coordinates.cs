@@ -128,6 +128,7 @@ public sealed partial class ClimateSystem
         // 用户在上一轮重算完成前再次拖动时，立即丢弃旧范围的后台任务。
         _coordinateRebuildStage = 0;
         _coordinateRebuildCursor = 0;
+        InitializeContinuousAtmosphere();
         _coordinateRangePending = true;
         _coordinateRangeApplyAt = Time.unscaledTime + delay;
     }

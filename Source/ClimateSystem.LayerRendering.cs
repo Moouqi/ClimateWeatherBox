@@ -21,6 +21,8 @@ public sealed partial class ClimateSystem
 
     private void BuildLayerRenderer()
     {
+        if (_pressureTexture != null) Destroy(_pressureTexture);
+        _pressureTexture = null;
         if (_layerRenderer != null) Destroy(_layerRenderer.gameObject);
         int width = Math.Max(1, MapBox.width);
         int height = Math.Max(1, MapBox.height);
@@ -67,7 +69,7 @@ public sealed partial class ClimateSystem
 
     private void MarkLayerDirtyPixel(int pixel)
     {
-        if (_visibleLayer == ClimateLayer.None || pixel < 0 || pixel >= _layerPixels.Length) return;
+        if (_visibleLayer == ClimateLayer.None || _visibleLayer == ClimateLayer.Wind || pixel < 0 || pixel >= _layerPixels.Length) return;
         _dirtyLayerPixels.Add(pixel);
     }
 
@@ -77,6 +79,8 @@ public sealed partial class ClimateSystem
     /// </summary>
     private void RefreshLayer(bool forceFull = false)
     {
+        // Wind uses a coherent atmospheric snapshot, never dirty terrain caches.
+        if (_visibleLayer == ClimateLayer.Wind) return;
         if (_visibleLayer == ClimateLayer.None || _layerTexture == null || _cells.Length == 0) return;
         WorldTile[] tiles = World.world?.tiles_list;
         if (tiles == null) return;
@@ -117,6 +121,8 @@ public sealed partial class ClimateSystem
 
     private Color32 LayerColorForPixel(int cellIndex, int pixel)
     {
+        if (_visibleLayer == ClimateLayer.AirHumidity) return HumidityColor(_cells[cellIndex].RelativeHumidity);
+        if (_visibleLayer == ClimateLayer.Rainfall) return HumidityColor(Mathf.Clamp01(_cells[cellIndex].RainRate * 1000f));
         if (_visibleLayer == ClimateLayer.Wind)
             return PressureColor(cellIndex, pixel);
         return _visibleLayer == ClimateLayer.Temperature
