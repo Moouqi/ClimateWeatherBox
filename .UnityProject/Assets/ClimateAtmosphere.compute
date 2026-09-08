@@ -1,0 +1,288 @@
+// 气候与四季：大气 compute kernel。
+// 完整移植 CPU 的 StepContinuousAtmosphere：风、气压、气温、水汽、云、降水
+// 与 donor-cell 输运，每步把气压/风/水汽直接写入 AtmosDisplay 渲染纹理，
+// 显示路径无需 CPU 回读（回读仅保留给群系与天气玩法逻辑）。
+#pragma kernel Step
+
+struct State { float4 Thermo; float4 Motion; float4 Ledger; float4 Extra; };
+struct Surface { float4 Ground; float4 Geo; float4 Position; };
+
+StructuredBuffer<State> Previous;
+RWStructuredBuffer<State> Next;
+StructuredBuffer<Surface> Terrain;
+RWTexture2D<float4> AtmosDisplay;
+
+int Width;
+int Height;
+int WrapLongitude;
+float LatitudeMin;
+float LatitudeMax;
+float LongitudeSpan;
+float Clock;
+float Declination;        // 太阳赤纬，度
+float Greenhouse;
+float HeatTransmission;
+float AgeTemperature;
+float Seed;
+
+#define PI 3.14159265
+// SeasonSeconds(180) * 4
+#define SEASON_CYCLE 720.0
+
+int Idx(int x, int y)
+{
+    if (WrapLongitude == 1) x = (x % Width + Width) % Width;
+    x = clamp(x, 0, Width - 1);
+    y = clamp(y, 0, Height - 1);
+    return y * Width + x;
+}
+
+float SaturationWater(float t)
+{
+    t = clamp(t, -70.0, 65.0);
+    return 0.12 * exp(17.625 * t / (243.04 + t));
+}
+
+float PressureBelt(float latDeg, float centerDeg, float halfWidthDeg)
+{
+    float d = abs(latDeg - centerDeg);
+    return 1.0 - smoothstep(0.0, 1.0, saturate(d / max(1.0, halfWidthDeg)));
+}
+
+float2 GlobalWindBelt(float signedLat, out float strength)
+{
+    float hemi = signedLat < -0.001 ? -1.0 : 1.0;
+    float latDeg = abs(signedLat) * 90.0;
+    float2 trade = normalize(float2(-1.0, -hemi * 0.62));
+    float2 westerly = normalize(float2(1.0, hemi * 0.62));
+    float2 polarEasterly = normalize(float2(-1.0, -hemi * 0.55));
+    float2 dir;
+    float zonePos;
+    if (latDeg < 27.0) { dir = trade; zonePos = latDeg / 30.0; }
+    else if (latDeg < 33.0) { dir = normalize(lerp(trade, westerly, smoothstep(0.0, 1.0, (latDeg - 27.0) / 6.0))); zonePos = 0.0; }
+    else if (latDeg < 57.0) { dir = westerly; zonePos = (latDeg - 30.0) / 30.0; }
+    else if (latDeg < 63.0) { dir = normalize(lerp(westerly, polarEasterly, smoothstep(0.0, 1.0, (latDeg - 57.0) / 6.0))); zonePos = 0.0; }
+    else { dir = polarEasterly; zonePos = (latDeg - 60.0) / 30.0; }
+    strength = lerp(0.30, 0.72, max(0.0, sin(saturate(zonePos) * PI)));
+    return dir;
+}
+
+// 梯度噪声，替代 CPU 的 Mathf.PerlinNoise 做天气尺度扰动；相位统计特性一致。
+float2 Hash22(float2 p)
+{
+    float2 q = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+    return frac(sin(q) * 43758.5453) * 2.0 - 1.0;
+}
+
+float GradientNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float a = dot(Hash22(i), f);
+    float b = dot(Hash22(i + float2(1, 0)), f - float2(1, 0));
+    float c = dot(Hash22(i + float2(0, 1)), f - float2(0, 1));
+    float d = dot(Hash22(i + float2(1, 1)), f - float2(1, 1));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y) * 0.70 + 0.35;
+}
+
+float BaselinePressure(Surface s, float signedLat, float gx, float gy, bool ocean)
+{
+    float latitudeDegrees = signedLat * 90.0;
+    float latitude = abs(signedLat);
+    float temperatureC = s.Ground.x;
+    float declinationDegrees = Declination;
+    float seasonalPhase = clamp(declinationDegrees / 23.44, -1.0, 1.0);
+    float itczLatitude = declinationDegrees * 0.65;
+    float beltShift = declinationDegrees * 0.24;
+    float subpolarShift = declinationDegrees * 0.14;
+    float equatorialLow = PressureBelt(latitudeDegrees, itczLatitude, 17.0) * -9.0;
+    float subtropicalHigh = PressureBelt(latitudeDegrees, 30.0 + beltShift, 15.0) * 9.5 +
+                            PressureBelt(latitudeDegrees, -30.0 + beltShift, 15.0) * 9.5;
+    float subpolarLow = PressureBelt(latitudeDegrees, 60.0 + subpolarShift, 17.0) * -9.0 +
+                        PressureBelt(latitudeDegrees, -60.0 + subpolarShift, 17.0) * -9.0;
+    float northPolarStrength = 8.0 - seasonalPhase * 3.5;
+    float southPolarStrength = 8.0 + seasonalPhase * 3.5;
+    float polarHigh = saturate((latitudeDegrees - 72.0) / 18.0) * northPolarStrength +
+                      saturate((-latitudeDegrees - 72.0) / 18.0) * southPolarStrength;
+    float weatherTime = Clock * 0.0024;
+    float synopticNoise = GradientNoise(float2(
+        gx * 0.004 + Seed * 0.0017 - weatherTime,
+        gy * 0.004 - Seed * 0.0011 + weatherTime * 0.37)) - 0.5;
+    float synoptic = synopticNoise * (ocean ? 2.0 : 1.5);
+    float yearPhase = Clock / SEASON_CYCLE * 2.0 * PI;
+    float zonalReferenceC = -45.0 + 39.0 * (1.0 - pow(latitude, 1.30)) +
+                            Greenhouse * 33.0 +
+                            sin(yearPhase) * (signedLat >= 0.0 ? 1.0 : -1.0) *
+                            pow(latitude, 0.80) * 16.0 +
+                            (HeatTransmission - 1.0) * 18.0 + AgeTemperature;
+    float temperatureAnomaly = clamp(temperatureC - zonalReferenceC, -22.0, 22.0);
+    float thermalAnomalyPressure = -temperatureAnomaly * (ocean ? 0.24 : 0.43);
+    float localSummer = seasonalPhase * (signedLat >= 0.0 ? 1.0 : -1.0);
+    if (abs(signedLat) < 0.08) localSummer *= latitude / 0.08;
+    float oceanInfluence = s.Position.z;
+    float landInfluence = 1.0 - oceanInfluence;
+    float seasonalLandSea = localSummer *
+        (oceanInfluence * lerp(1.5, 4.5, latitude) -
+         landInfluence * lerp(3.5, 9.0, latitude));
+    return clamp(1013.25 + equatorialLow + subtropicalHigh + subpolarLow +
+                 polarHigh + synoptic + thermalAnomalyPressure + seasonalLandSea,
+                 968.0, 1052.0);
+}
+
+[numthreads(8, 8, 1)]
+void Step(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)Width || id.y >= (uint)Height) return;
+    int x = (int)id.x;
+    int y = (int)id.y;
+    int i = y * Width + x;
+
+    State a = Previous[i];
+    Surface s = Terrain[i];
+    bool ocean = s.Ground.z > 0.5;
+    State l = Previous[Idx(x - 1, y)];
+    State r = Previous[Idx(x + 1, y)];
+    State d = Previous[Idx(x, y - 1)];
+    State u = Previous[Idx(x, y + 1)];
+
+    float lat = s.Geo.z;
+    float dx = max(0.5, LongitudeSpan / Width * max(0.18, cos(lat * PI * 0.5)));
+    float dy = max(0.5, (LatitudeMax - LatitudeMin) / Height);
+
+    // 速度：气压梯度 + 三圈环流 + 隐式科里奥利 + 地形绕流。
+    float2 force = float2((l.Thermo.w - r.Thermo.w) / dx,
+                          (d.Thermo.w - u.Thermo.w) / dy) * 0.10;
+    float beltStrength;
+    float2 background = GlobalWindBelt(lat, beltStrength) * beltStrength;
+    float2 v = a.Motion.yz + force + (background - a.Motion.yz) * 0.006;
+    float f = sin(lat * PI * 0.5) * 0.10;
+    v = float2(v.x + f * v.y, v.y - f * v.x) / (1.0 + f * f);
+    float2 slope = s.Geo.xy;
+    float uphill = max(0.0, dot(v, slope));
+    if (dot(slope, slope) > 0.001) v -= normalize(slope) * uphill * 0.45;
+    v /= 1.0 + (ocean ? 0.012 : 0.035 + s.Ground.w * 0.035);
+    float speed = length(v);
+    if (speed > 1.5) v *= 1.5 / speed;
+
+    float divergence = (r.Motion.y - l.Motion.y) / dx +
+                       (u.Motion.z - d.Motion.z) / dy;
+    float baseline = BaselinePressure(s, lat, x, y, ocean);
+    float pressure = clamp(a.Thermo.w + (baseline - a.Thermo.w) / 180.0 -
+                           divergence * 0.12, 960.0, 1055.0);
+    float ground = clamp(s.Ground.x, -70.0, 90.0);
+    float temperature = a.Thermo.x + (ground - a.Thermo.x) / (ocean ? 160.0 : 90.0);
+    float saturation = SaturationWater(a.Thermo.x);
+    float deficit = saturate(1.0 - a.Thermo.y / saturation);
+    float evaporation = (ocean ? 0.0008 : 0.00035 * s.Ground.y) *
+        lerp(0.12, 2.0, saturate((ground + 5.0) / 50.0)) *
+        (0.25 + deficit) * (1.0 + length(v));
+    if (s.Geo.w > 0.5) evaporation *= 0.03;
+    if (s.Position.w > 0.5) evaporation = 0.0;
+    evaporation = ocean ? evaporation : min(evaporation, s.Ground.y * 0.02);
+    float vapor = a.Thermo.y + evaporation;
+    temperature -= evaporation * 8.0;
+    float uplift = clamp(-divergence * 2.0 + uphill, -0.2, 0.4);
+    float saturationLifted = SaturationWater(a.Thermo.x - uplift * 6.0);
+    float condensation = max(0.0, a.Thermo.y - saturationLifted) * 0.15;
+    // 输运量与方向读自上一状态（与 CPU 一致），下一状态只做累加。
+    // Motion 布局 = (Rain, Velocity.x, Velocity.y, 0)。
+    float tx = min(0.1, abs(a.Motion.y) * 0.025 / dx);
+    float ty = min(0.1, abs(a.Motion.z) * 0.025 / dy);
+    float cloudBudget = max(0.0, a.Thermo.z * (1.0 - tx - ty));
+    float reevaporation = min(cloudBudget, max(0.0, saturation - a.Thermo.y) * 0.015);
+    vapor += reevaporation - condensation;
+    float cloud = a.Thermo.z + condensation - reevaporation;
+    temperature += (condensation - reevaporation) * 8.0;
+    float rain = min(max(0.0, cloudBudget - reevaporation),
+                     max(0.0, a.Thermo.z - 0.035) * 0.025);
+    cloud -= rain;
+
+    // donor-cell 输运：本格流出 + 重算四邻的流入（读同一前置缓冲，无竞争）。
+    float outVapor = 0.0, outCloud = 0.0, outHeat = 0.0;
+    float inVapor = 0.0, inCloud = 0.0, inHeat = 0.0;
+    float exportWater = 0.0;
+    bool global = WrapLongitude == 1;
+
+    // 自身沿 x 的流出。
+    int dsx = x + (a.Motion.y >= 0.0 ? 1 : -1);
+    if (dsx < 0 || dsx >= Width) {
+        if (global) {
+            int wx = (dsx % Width + Width) % Width;
+            outVapor += a.Thermo.y * tx; outCloud += a.Thermo.z * tx;
+            outHeat += (a.Thermo.x - Previous[y * Width + wx].Thermo.x) * tx;
+        } else {
+            outVapor += a.Thermo.y * tx; outCloud += a.Thermo.z * tx;
+            exportWater += a.Thermo.y * tx + a.Thermo.z * tx;
+        }
+    } else if (dsx != x) {
+        outVapor += a.Thermo.y * tx; outCloud += a.Thermo.z * tx;
+        outHeat += (a.Thermo.x - Previous[y * Width + dsx].Thermo.x) * tx;
+    }
+    // 自身沿 y 的流出（极地开边界时钳制回本行，等价于无操作）。
+    int dsy = y + (a.Motion.z >= 0.0 ? 1 : -1);
+    if (dsy >= 0 && dsy < Height) {
+        if (dsy != y) {
+            outVapor += a.Thermo.y * ty; outCloud += a.Thermo.z * ty;
+            outHeat += (a.Thermo.x - Previous[dsy * Width + x].Thermo.x) * ty;
+        }
+    } else if ((dsy < 0 && LatitudeMin > -89.9) || (dsy >= Height && LatitudeMax < 89.9)) {
+        outVapor += a.Thermo.y * ty; outCloud += a.Thermo.z * ty;
+        exportWater += a.Thermo.y * ty + a.Thermo.z * ty;
+    }
+
+    // 左邻流入（其 x 流出指向本格）。
+    if (global || x > 0) {
+        int lx = global ? (x - 1 + Width) % Width : x - 1;
+        State ln = Previous[y * Width + lx];
+        if (ln.Motion.y >= 0.0) {
+            float txl = min(0.1, abs(ln.Motion.y) * 0.025 / dx);
+            inVapor += ln.Thermo.y * txl; inCloud += ln.Thermo.z * txl;
+            inHeat += (ln.Thermo.x - a.Thermo.x) * txl;
+        }
+    }
+    // 右邻流入。
+    if (global || x < Width - 1) {
+        int rx = global ? (x + 1) % Width : x + 1;
+        State rn = Previous[y * Width + rx];
+        if (rn.Motion.y < 0.0) {
+            float txr = min(0.1, abs(rn.Motion.y) * 0.025 / dx);
+            inVapor += rn.Thermo.y * txr; inCloud += rn.Thermo.z * txr;
+            inHeat += (rn.Thermo.x - a.Thermo.x) * txr;
+        }
+    }
+    // 下邻流入（y 无回绕，只在界内存在）。
+    if (y > 0) {
+        State dn = Previous[(y - 1) * Width + x];
+        if (dn.Motion.z >= 0.0) {
+            float tyd = min(0.1, abs(dn.Motion.z) * 0.025 / dy);
+            inVapor += dn.Thermo.y * tyd; inCloud += dn.Thermo.z * tyd;
+            inHeat += (dn.Thermo.x - a.Thermo.x) * tyd;
+        }
+    }
+    // 上邻流入。
+    if (y < Height - 1) {
+        State un = Previous[(y + 1) * Width + x];
+        if (un.Motion.z < 0.0) {
+            float tyu = min(0.1, abs(un.Motion.z) * 0.025 / dy);
+            inVapor += un.Thermo.y * tyu; inCloud += un.Thermo.z * tyu;
+            inHeat += (un.Thermo.x - a.Thermo.x) * tyu;
+        }
+    }
+
+    State n;
+    n.Thermo = float4(temperature - outHeat + inHeat,
+                      vapor - outVapor + inVapor,
+                      cloud - outCloud + inCloud,
+                      pressure);
+    n.Motion = float4(rain, v.x, v.y, 0.0);
+    n.Ledger.x = a.Ledger.x + (a.Thermo.x > 0.0 ? rain : 0.0) - (ocean ? 0.0 : evaporation);
+    n.Ledger.y = a.Ledger.y + (a.Thermo.x <= 0.0 ? rain : 0.0);
+    n.Ledger.z = a.Ledger.z + exportWater;
+    n.Ledger.w = a.Ledger.w;
+    n.Extra = a.Extra;
+    Next[i] = n;
+
+    // 直写显示纹理：气压 / 风 / 水汽，等压线与尾迹层直接采样。
+    AtmosDisplay[uint2(x, y)] = float4(n.Thermo.w, n.Motion.y, n.Motion.z, n.Thermo.y);
+}

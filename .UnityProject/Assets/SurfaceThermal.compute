@@ -1,0 +1,278 @@
+// 气候与四季：地表温度 compute kernel。
+// 完整移植 CPU 的 UpdateDynamicTemperatures：太阳辐照、日平均温度、昼夜扰动、
+// 热惯性积分、SyncAtmosphere 地表-大气同步与生物群系气候记忆。
+// 采样大气后端的双缓冲状态缓冲区（与 ClimateAtmosphere.compute 同一数据布局），
+// 读回仅用于把温度/日照/云量/记忆交还 CPU 的群系与显示逻辑。
+#pragma kernel Step
+
+struct SurfaceState { float4 A; float4 B; float4 C; float4 D; float4 E; };
+struct AirGpu { float4 Thermo; float4 Motion; float4 Ledger; float4 Extra; };
+
+StructuredBuffer<SurfaceState> Previous;
+RWStructuredBuffer<SurfaceState> Next;
+StructuredBuffer<float4> Classification;   // x=分类位, y=地形海拔, z=河流湿度, w=平滑等高海拔
+StructuredBuffer<AirGpu> Air;
+RWTexture2D<float4> SurfaceADisplay;       // 温度、土壤湿度、相对湿度、降水强度
+RWTexture2D<float4> SurfaceBDisplay;       // 云量、等高海拔、冻结、日照
+
+int Width;
+int Height;
+int AirWidth;
+int AirHeight;
+int WrapLongitude;
+float LatitudeMin;
+float LatitudeMax;
+float LongitudeMin;
+float LongitudeMax;
+float Declination;          // 太阳赤纬，弧度
+float SubsolarLongitude;    // 太阳直射经度，弧度
+float Greenhouse;
+float LightTransmission;
+float HeatTransmission;
+float AgeSunlight;
+float AgeTemperature;
+float SeasonPhase;          // 年相位角，弧度
+float Elapsed;              // 距上次地表步进的模拟秒数（0-60）
+float Clock;                // 季节时钟（模拟秒）
+float Seed;
+
+#define PI 3.14159265
+#define FROZEN_SOLAR_ABSORPTION 0.38
+#define FROZEN_WARMING_RESPONSE 0.55
+
+// 分类位布局：0-1 海洋类别，2-4 群系幅度类别，5 沙地，6 海岸，
+// 7 雪峰，8 冰冻地表，9 岩浆，10-11 岩浆等级，12 地表海洋。
+uint OceanClassOf(uint bits) { return bits & 3u; }
+uint BiomeClassOf(uint bits) { return (bits >> 2) & 7u; }
+bool SandOf(uint bits) { return (bits & (1u << 5)) != 0u; }
+bool CoastalOf(uint bits) { return (bits & (1u << 6)) != 0u; }
+bool SnowPeakOf(uint bits) { return (bits & (1u << 7)) != 0u; }
+bool FrozenOf(uint bits) { return (bits & (1u << 8)) != 0u; }
+bool LavaOf(uint bits) { return (bits & (1u << 9)) != 0u; }
+float LavaLevelOf(uint bits) { return (float)((bits >> 10) & 3u); }
+bool SurfaceOceanOf(uint bits) { return (bits & (1u << 12)) != 0u; }
+
+int AirIdx(int x, int y)
+{
+    if (WrapLongitude == 1) x = (x % AirWidth + AirWidth) % AirWidth;
+    x = clamp(x, 0, AirWidth - 1);
+    y = clamp(y, 0, AirHeight - 1);
+    return y * AirWidth + x;
+}
+
+float SaturationWater(float t)
+{
+    t = clamp(t, -70.0, 65.0);
+    return 0.12 * exp(17.625 * t / (243.04 + t));
+}
+
+// 梯度噪声，替代 CPU 的 Mathf.PerlinNoise 做地表扰动；相位统计特性一致。
+float2 Hash22(float2 p)
+{
+    float2 q = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+    return frac(sin(q) * 43758.5453) * 2.0 - 1.0;
+}
+
+float GradientNoise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float a = dot(Hash22(i), f);
+    float b = dot(Hash22(i + float2(1, 0)), f - float2(1, 0));
+    float c = dot(Hash22(i + float2(0, 1)), f - float2(0, 1));
+    float d = dot(Hash22(i + float2(1, 1)), f - float2(1, 1));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y) * 0.70 + 0.35;
+}
+
+// 复刻 CPU 的 SampleAir 双线性采样，返回所需的大气分量。
+void SampleAir(float tileX, float tileY,
+    out float temperature, out float vapor, out float cloud, out float pressure,
+    out float rain, out float2 velocity, out float waterBalance, out float snowfall)
+{
+    float gx = (tileX - 4.0) / 8.0;
+    float gy = (tileY - 4.0) / 8.0;
+    int ix = (int)floor(gx);
+    int iy = (int)floor(gy);
+    float fx = gx - ix;
+    float fy = gy - iy;
+    int i00 = AirIdx(ix, iy);
+    int i10 = AirIdx(ix + 1, iy);
+    int i01 = AirIdx(ix, iy + 1);
+    int i11 = AirIdx(ix + 1, iy + 1);
+    AirGpu a = Air[i00];
+    AirGpu b = Air[i10];
+    AirGpu c = Air[i01];
+    AirGpu d = Air[i11];
+    float4 thermoTop = lerp(a.Thermo, b.Thermo, fx);
+    float4 thermoBottom = lerp(c.Thermo, d.Thermo, fx);
+    float4 thermo = lerp(thermoTop, thermoBottom, fy);
+    float4 motionTop = lerp(a.Motion, b.Motion, fx);
+    float4 motionBottom = lerp(c.Motion, d.Motion, fx);
+    float4 motion = lerp(motionTop, motionBottom, fy);
+    float waterTop = lerp(a.Ledger.x - a.Ledger.z, b.Ledger.x - b.Ledger.z, fx);
+    float waterBottom = lerp(c.Ledger.x - c.Ledger.z, d.Ledger.x - d.Ledger.z, fx);
+    float snowTop = lerp(a.Ledger.y - a.Ledger.w, b.Ledger.y - b.Ledger.w, fx);
+    float snowBottom = lerp(c.Ledger.y - c.Ledger.w, d.Ledger.y - d.Ledger.w, fx);
+    temperature = thermo.x;
+    vapor = thermo.y;
+    cloud = thermo.z;
+    pressure = thermo.w;
+    rain = motion.x;
+    velocity = motion.yz;
+    waterBalance = lerp(waterTop, waterBottom, fy);
+    snowfall = lerp(snowTop, snowBottom, fy);
+}
+
+[numthreads(8, 8, 1)]
+void Step(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)Width || id.y >= (uint)Height) return;
+    int x = (int)id.x;
+    int y = (int)id.y;
+    int i = y * Width + x;
+
+    SurfaceState prev = Previous[i];
+    float4 cls = Classification[i];
+    uint bits = asuint(cls.x);
+    float elevation = cls.y;
+    float riverMoisture = cls.z;
+    bool lava = LavaOf(bits);
+    bool frozen = FrozenOf(bits);
+    bool snowPeak = SnowPeakOf(bits);
+    bool oceanSurface = OceanClassOf(bits) != 0u;
+
+    float noise = GradientNoise(float2(x * 0.025 + Seed * 0.001, y * 0.025));
+    float signedLatitude = lerp(LatitudeMin, LatitudeMax, (y + 0.5) / Height) / 90.0;
+    float latitude = abs(signedLatitude);
+    float latitudeRadians = signedLatitude * PI * 0.5;
+    float longitudeRadians = lerp(LongitudeMin, LongitudeMax, x / max(1.0, Width - 1.0)) * PI / 180.0;
+    float hourAngle = longitudeRadians - SubsolarLongitude;
+
+    // ---- 太阳辐照：直射 + 晨昏过渡 + 大气透射。 ----
+    float solarAltitude = sin(latitudeRadians) * sin(Declination) +
+                          cos(latitudeRadians) * cos(Declination) * cos(hourAngle);
+    float directSun = pow(saturate(solarAltitude), 0.62);
+    float twilight = smoothstep(0.0, 1.0, saturate((solarAltitude + 0.10) / 0.20));
+    float sunlight = saturate((directSun * 0.88 + twilight * 0.08) * LightTransmission +
+                              (noise - 0.5) * 0.06);
+    sunlight = saturate(sunlight * AgeSunlight);
+
+    // ---- 日平均温度：纬度辐射基准 + 温室 + 季节 + 海拔。 ----
+    float absorbedSolarFactor = snowPeak ? 0.72 : 1.0;
+    if (frozen) absorbedSolarFactor *= FROZEN_SOLAR_ABSORPTION;
+    float radiativeBaseC = -45.0 + 39.0 * (1.0 - pow(latitude, 1.30));
+    float seasonalC = sin(SeasonPhase) * (signedLatitude >= 0.0 ? 1.0 : -1.0) *
+                      pow(latitude, 0.80) * 16.0;
+    float altitudeCoolingC = elevation * 12.0 + (snowPeak ? 4.0 : 0.0);
+    float meanC = radiativeBaseC + Greenhouse * 33.0 + seasonalC +
+                  (HeatTransmission - 1.0) * 18.0 + (noise - 0.5) * 6.0 -
+                  altitudeCoolingC + AgeTemperature;
+
+    // ---- 昼夜扰动幅度：按海洋/群系分类，海岸与湿润度削弱。 ----
+    float humidity = saturate(prev.A.z);
+    float amplitudeC;
+    if (oceanSurface)
+    {
+        uint oceanClass = OceanClassOf(bits);
+        amplitudeC = oceanClass == 1u ? 2.5 : oceanClass == 2u ? 1.5 : 0.8;
+        amplitudeC *= lerp(1.0, 0.70, humidity);
+    }
+    else
+    {
+        uint biome = BiomeClassOf(bits);
+        amplitudeC = biome == 1u ? 12.0 : biome == 2u ? 10.0 : biome == 3u ? 7.0 :
+                     biome == 4u ? 7.0 : biome == 5u ? 6.0 : biome == 6u ? 5.0 : 8.0;
+        if (CoastalOf(bits)) amplitudeC *= 0.78;
+        amplitudeC *= lerp(1.0, 0.55, humidity);
+    }
+    float latitudeAttenuation = sqrt(saturate(cos(latitudeRadians)));
+    float diurnalC = amplitudeC * cos(hourAngle) * latitudeAttenuation;
+    if (diurnalC >= 0.0)
+        diurnalC *= HeatTransmission * absorbedSolarFactor * lerp(1.0, 0.82, humidity);
+    else
+        diurnalC *= lerp(1.0, 0.72, humidity);
+
+    float targetC = meanC + diurnalC;
+    float solarTarget = saturate((targetC + 50.0) / 100.0);
+    float target = solarTarget;
+    if (lava)
+        target = max(target, 0.78 + clamp(LavaLevelOf(bits), 0.0, 3.0) * 0.065);
+
+    // ---- 地表-大气同步：采样最新大气状态。 ----
+    float airT, vapor, cloud, pressure, rain, waterBalance, snowfall;
+    float2 velocity;
+    SampleAir(x, y, airT, vapor, cloud, pressure, rain, velocity, waterBalance, snowfall);
+    float relativeHumidity = saturate(vapor / max(1e-5, SaturationWater(airT)));
+    float cloudCover = 1.0 - exp(-cloud * 8.0);
+
+    // ---- 热惯性积分：云遮蔽 + 边界层耦合 + 地表热时间常数。 ----
+    float temperature = prev.A.x;
+    if (!lava)
+    {
+        target += cloudCover * (0.025 - sunlight * 0.07);
+        target = lerp(target, (airT + 50.0) / 100.0, 0.15);
+    }
+    float thermalTime;
+    if (lava) thermalTime = 2.5;
+    else if (oceanSurface)
+    {
+        uint oceanClass = OceanClassOf(bits);
+        thermalTime = oceanClass == 1u ? 85.0 : oceanClass == 2u ? 125.0 : 175.0;
+    }
+    else
+    {
+        uint biome = BiomeClassOf(bits);
+        thermalTime = SandOf(bits) ? 18.0 :
+                      (biome == 6u ? 45.0 : (biome == 4u || biome == 5u) ? 38.0 : 30.0);
+        thermalTime *= lerp(1.0, 1.35, humidity);
+    }
+    if (frozen)
+        thermalTime *= solarTarget > temperature ? 1.0 / FROZEN_WARMING_RESPONSE : 1.20;
+    float thermalResponse = 1.0 - exp(-Elapsed / max(1.0, thermalTime));
+    temperature = lerp(temperature, target, thermalResponse);
+
+    // ---- 水分账本：降雪积累、融雪补给、水汽平衡与河流拉动。 ----
+    float snowWater = prev.C.w;
+    float soil = prev.A.z;
+    if (!SurfaceOceanOf(bits) && Elapsed > 0.0)
+    {
+        snowWater += max(0.0, snowfall - prev.E.x);
+        float melt = min(snowWater, max(0.0, lerp(-50.0, 50.0, saturate(temperature))) *
+                                  Elapsed * 0.0001);
+        snowWater -= melt;
+        soil = saturate(soil + (waterBalance - prev.D.w) + melt);
+        soil += max(0.0, riverMoisture - soil) * (1.0 - exp(-Elapsed / 90.0));
+    }
+
+    // ---- 生物群系气候记忆：慢时间常数的温湿滑动平均。 ----
+    float biomeTemperature = prev.D.x;
+    float biomeMoisture = prev.D.y;
+    if (prev.D.z < 0.5)
+    {
+        biomeTemperature = temperature;
+        biomeMoisture = soil;
+    }
+    else
+    {
+        float memoryResponse = 1.0 - exp(-max(0.0, Elapsed) / 180.0);
+        biomeTemperature = lerp(biomeTemperature, temperature, memoryResponse);
+        biomeMoisture = lerp(biomeMoisture, soil, memoryResponse);
+    }
+
+    SurfaceState next;
+    next.A = float4(temperature, lerp(prev.A.y, sunlight, 1.0 - exp(-Elapsed / 8.0)),
+                    soil, cloudCover);
+    next.B = float4(airT, relativeHumidity, pressure, rain);
+    next.C = float4(velocity, length(velocity), snowWater);
+    next.D = float4(biomeTemperature, biomeMoisture, 1.0, waterBalance);
+    next.E = float4(snowfall, Clock, 0.0, 0.0);
+    Next[i] = next;
+
+    // 直写显示纹理，通道布局与 CPU 的 FillSurfaceFields 完全一致。
+    float shownSunlight = next.A.y;
+    SurfaceADisplay[uint2(x, y)] = float4(temperature, soil, relativeHumidity,
+                                          saturate(rain * 1000.0));
+    SurfaceBDisplay[uint2(x, y)] = float4(cloudCover, cls.w,
+                                          frozen ? 1.0 : 0.0, shownSunlight);
+}
