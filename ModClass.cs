@@ -21,9 +21,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private const int BareBiomeRepairsPerTick = 512;
     private const float BiomeTransitionDelay = 90f;
     private const int TerrainChangeCentersPerFrame = 256;
-    private const float NightTextureRefreshSeconds = 0.4f;
     private const float RiverMoistureRebuildDelay = 0.35f;
-    private const float LayerRefreshSeconds = 0.25f;
     private const float FrozenSolarAbsorption = 0.38f;
     private const float FrozenWarmingResponse = 0.55f;
     private const float LandRainfallMoistureMultiplier = 1.80f;
@@ -60,18 +58,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private float _atmosphereThickness = 1f;
     private string _currentAgeId = string.Empty;
     private AgeClimateProfile _ageClimateProfile = AgeClimateProfile.Normal;
-    private Texture2D _layerTexture;
-    private Texture2D _nightTexture;
-    private SpriteRenderer _layerRenderer;
-    private Color32[] _layerPixels = Array.Empty<Color32>();
-    private Color32[] _nightPixels = Array.Empty<Color32>();
-    private float[] _nightSinLatitudes = Array.Empty<float>();
-    private float[] _nightCosLatitudes = Array.Empty<float>();
-    private float[] _nightCosHourAngles = Array.Empty<float>();
     private float[] _terrainRawElevation = Array.Empty<float>();
     private float[] _terrainElevation = Array.Empty<float>();
-    private float _nextNightRefresh;
-    private float _nextLayerRefresh;
     private int[] _cellIndexByPixel = Array.Empty<int>();
     private int[] _climateTraversalOrder = Array.Empty<int>();
     private int _rainEvents;
@@ -135,24 +123,71 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private bool _riverMoistureFieldDirty = true;
     private float _riverMoistureRebuildAt;
 
-    private enum ClimateLayer { None, Temperature, Humidity, Wind, Elevation, Clouds, AirHumidity, Rainfall }
-
     public Season CurrentSeason => (Season)(((int)(_seasonClock / SeasonSeconds)) & 3);
-    internal bool OriginalDarkAgeLightingReady => _cells.Length > 0 && _nightTexture != null;
     internal bool IsApplyingClimateBiome => _applyingClimateBiome;
+
+    // 昼夜判定查表：行 sin/cos 依纬度映射缓存，列 hour-angle 余弦与赤纬每帧重建。
+    // 悬停提示、灯光蒙版、窗户光过滤共用，单次查询只剩查表与乘加。
+    private float[] _nightRowSin = Array.Empty<float>();
+    private float[] _nightRowCos = Array.Empty<float>();
+    private float[] _nightColCosHour = Array.Empty<float>();
+    private float _nightSinDec, _nightCosDec;
+    private int _nightCacheFrame = -1;
+    private float _nightRowLatMin = float.NaN, _nightRowLatMax = float.NaN;
+    internal bool HasAnyNight { get; private set; }
 
     internal bool IsNightAt(WorldTile tile)
     {
         if (tile == null || MapBox.width <= 1) return false;
         if (World.world?.era_manager?.getCurrentAge()?.overlay_darkness == true) return true;
-        float latitude = GetSignedLatitude(tile.pos.y) * Mathf.PI * 0.5f;
-        float longitude = LongitudeRadiansAt(tile.pos.x);
-        float declination = CurrentSolarDeclinationRadians();
-        float subsolarLongitude = CurrentSubsolarLongitudeRadians();
-        float hourAngle = longitude - subsolarLongitude;
-        float sinAltitude = Mathf.Sin(latitude) * Mathf.Sin(declination) +
-                            Mathf.Cos(latitude) * Mathf.Cos(declination) * Mathf.Cos(hourAngle);
+        if (Time.frameCount != _nightCacheFrame) RefreshNightLookup();
+        if (tile.pos.y >= _nightRowSin.Length || tile.pos.x >= _nightColCosHour.Length) return false;
+        float sinAltitude = _nightRowSin[tile.pos.y] * _nightSinDec +
+                            _nightRowCos[tile.pos.y] * _nightCosDec * _nightColCosHour[tile.pos.x];
         return sinAltitude < -0.02f;
+    }
+
+    private void RefreshNightLookup()
+    {
+        _nightCacheFrame = Time.frameCount;
+        int width = Math.Max(1, MapBox.width);
+        int height = Math.Max(1, MapBox.height);
+        float declination = CurrentSolarDeclinationRadians();
+        _nightSinDec = Mathf.Sin(declination);
+        _nightCosDec = Mathf.Cos(declination);
+        float subsolarLongitude = CurrentSubsolarLongitudeRadians();
+        if (_nightColCosHour.Length != width) _nightColCosHour = new float[width];
+        for (int x = 0; x < width; x++)
+            _nightColCosHour[x] = Mathf.Cos(LongitudeRadiansAt(x) - subsolarLongitude);
+        if (_nightRowSin.Length != height ||
+            _nightRowLatMin != _latitudeMinDegrees || _nightRowLatMax != _latitudeMaxDegrees)
+        {
+            _nightRowSin = new float[height];
+            _nightRowCos = new float[height];
+            for (int y = 0; y < height; y++)
+            {
+                float latitude = GetSignedLatitude(y) * Mathf.PI * 0.5f;
+                _nightRowSin[y] = Mathf.Sin(latitude);
+                _nightRowCos[y] = Mathf.Cos(latitude);
+            }
+            _nightRowLatMin = _latitudeMinDegrees;
+            _nightRowLatMax = _latitudeMaxDegrees;
+        }
+        // 5×5 粗采样判定全图是否仍有夜晚，供 shouldShowLights 门控；
+        // 细窄夜带可能漏检，只影响窗户光在极端模板下的显示时机。
+        bool any = false;
+        for (int ry = 0; ry < 5 && !any; ry++)
+        {
+            int y = Math.Min(height - 1, ry * (height - 1) / 4);
+            for (int rx = 0; rx < 5; rx++)
+            {
+                int x = Math.Min(width - 1, rx * (width - 1) / 4);
+                float sinAltitude = _nightRowSin[y] * _nightSinDec +
+                                    _nightRowCos[y] * _nightCosDec * _nightColCosHour[x];
+                if (sinAltitude < -0.02f) { any = true; break; }
+            }
+        }
+        HasAnyNight = any;
     }
 
     private void Awake()
@@ -176,7 +211,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void OnDestroy()
     {
+        ResetGpuThermal();
         _gpuAtmosphere?.Dispose();
+        Fields?.Dispose();
+        Fields = null;
         if (Active == this) Active = null;
     }
 
@@ -196,25 +234,40 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (!EnsureWorld()) return;
         if (StepCoordinateRangeRebuild()) return;
         RefreshAgeClimateProfileIfNeeded();
+        Bench.bench("mod.TerrainChanges", "cpu");
         ProcessTerrainChanges();
+        Bench.benchEnd("mod.TerrainChanges", "cpu", false, 0);
         TryStartAutomaticRiverGeneration();
         StepRiverMoistureField();
+        Bench.bench("mod.DisplayFields", "cpu");
+        RefreshDisplayFields();
+        Bench.benchEnd("mod.DisplayFields", "cpu", false, 0);
         if (World.world.isPaused()) return;
         _seasonClock += Time.deltaTime;
+        Bench.bench("mod.Atmosphere", "cpu");
         AdvanceContinuousAtmosphere();
+        Bench.benchEnd("mod.Atmosphere", "cpu", false, 0);
         UpdateTropicalCyclones();
         _solarTick += Time.deltaTime;
         if (_solarTick >= SolarTickSeconds)
         {
             _solarTick = 0f;
+            Bench.bench("mod.DynamicTemp", "cpu");
             UpdateDynamicTemperatures();
+            Bench.benchEnd("mod.DynamicTemp", "cpu", false, 0);
         }
         _tick += Time.deltaTime;
         if (_tick < TickSeconds) return;
         _tick = 0f;
+        Bench.bench("mod.StepClimate", "cpu");
         StepClimate();
+        Bench.benchEnd("mod.StepClimate", "cpu", false, 0);
+        Bench.bench("mod.StepRivers", "cpu");
         StepRivers();
+        Bench.benchEnd("mod.StepRivers", "cpu", false, 0);
+        Bench.bench("mod.Weather", "cpu");
         GenerateWeather();
+        Bench.benchEnd("mod.Weather", "cpu", false, 0);
     }
 
     private bool EnsureWorld()
@@ -236,6 +289,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         RepairInvalidOceanSnow(tiles);
 
         _gpuAtmosphere?.Dispose(); _gpuAtmosphere = null;
+        ResetGpuThermal();
         _air = Array.Empty<AirState>();
         _cursor = 0;
         _solarCursor = 0;
@@ -298,8 +352,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         for (int i = 0; i < tiles.Length; i++) UpdatePressure(tiles[i], initialized[i], true);
         for (int i = 0; i < tiles.Length; i++) CalculateWind(tiles[i], initialized[i], true);
         InitializeContinuousAtmosphere();
-        BuildLayerRenderer();
-        RefreshLayer();
+        InitializeFields();
         RefreshClimateAverages(true);
         return true;
     }
@@ -379,7 +432,6 @@ public sealed partial class ClimateSystem : MonoBehaviour
         _currentAgeId = ageId;
         _ageClimateProfile = profile;
         _solarCursor = 0;
-        _nextNightRefresh = 0f;
         _biomeTransitionStates.Clear();
         _pendingBiomeTransitions.Clear();
         _pendingBareBiomeRepairs.Clear();
@@ -397,29 +449,55 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (_climateTraversalOrder.Length != tiles.Length) BuildClimateTraversalOrder();
         if (_climateTraversalOrder.Length == 0) return;
         int count = Math.Min(TilesPerTick, _climateTraversalOrder.Length);
+        // 拆分测量在循环内只累计秒表读数，循环外一次性写入 Bench，
+        // 避免每个格子都触发字典查询扭曲测量结果。
+        long windTicks = 0, lavaTicks = 0, vegetationTicks = 0,
+             droughtTicks = 0, biomeTicks = 0, polarTicks = 0;
         for (int n = 0; n < count; n++)
         {
             int orderPosition = (_cursor + n) % _climateTraversalOrder.Length;
             int index = _climateTraversalOrder[orderPosition];
             if (index < 0 || index >= tiles.Length) continue;
             CalculateCell(tiles[index], _cells[index], false, false);
+            long segment = System.Diagnostics.Stopwatch.GetTimestamp();
             CalculateWind(tiles[index], _cells[index], false);
+            windTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
+            segment = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateLavaCooling(tiles[index], _cells[index]);
+            lavaTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
+            segment = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateVegetationTemperatureStress(tiles[index], _cells[index]);
-            if (_visibleLayer == ClimateLayer.Humidity)
-                MarkLayerDirtyIndex(index, tiles[index]);
+            vegetationTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
+            segment = System.Diagnostics.Stopwatch.GetTimestamp();
             if (UpdateExtremeDroughtTerrain(tiles[index], _cells[index]))
             {
+                droughtTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
                 InvalidateQueuedBiome(index);
                 continue;
             }
+            droughtTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
+            segment = System.Diagnostics.Stopwatch.GetTimestamp();
             EvaluateClimateBiome(index, tiles[index], _cells[index]);
+            biomeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
+            segment = System.Diagnostics.Stopwatch.GetTimestamp();
             ApplyPolarFreezing(tiles[index], _cells[index]);
+            polarTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
         }
         _cursor = (_cursor + count) % _climateTraversalOrder.Length;
+        Bench.bench("mod.Climate.Repair", "cpu");
         RepairBareBiomeTiles(tiles);
+        Bench.benchEnd("mod.Climate.Repair", "cpu", false, 0);
+        Bench.bench("mod.Climate.BiomeApply", "cpu");
         ApplyQueuedBiomeTransitions(tiles, BiomeChanges);
-        if (_visibleLayer != ClimateLayer.None) RefreshLayer();
+        Bench.benchEnd("mod.Climate.BiomeApply", "cpu", false, 0);
+        if (!Bench.bench_enabled) return;
+        double toSeconds = 1.0 / System.Diagnostics.Stopwatch.Frequency;
+        Bench.benchSave("mod.Climate.Wind", windTicks * toSeconds, 0, "cpu");
+        Bench.benchSave("mod.Climate.Lava", lavaTicks * toSeconds, 0, "cpu");
+        Bench.benchSave("mod.Climate.Vegetation", vegetationTicks * toSeconds, 0, "cpu");
+        Bench.benchSave("mod.Climate.Drought", droughtTicks * toSeconds, 0, "cpu");
+        Bench.benchSave("mod.Climate.Biome", biomeTicks * toSeconds, 0, "cpu");
+        Bench.benchSave("mod.Climate.Polar", polarTicks * toSeconds, 0, "cpu");
     }
 
     /// <summary>
@@ -436,7 +514,6 @@ public sealed partial class ClimateSystem : MonoBehaviour
         if (pixel >= 0 && pixel < _cellIndexByPixel.Length && _cellIndexByPixel[pixel] >= 0)
         {
             _pendingTerrainPixels.Add(pixel);
-            MarkLayerDirtyPixel(pixel);
             if (riverTopologyChanged)
             {
                 _riverMoistureFieldDirty = true;
@@ -499,14 +576,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
             if (tile?.Type != null)
             {
                 CalculateWind(tile, _cells[index], true);
-                MarkLayerDirtyIndex(index, tile);
+                MarkThermalClassificationDirty(index);
             }
-        }
-
-        if (_visibleLayer != ClimateLayer.None && Time.unscaledTime >= _nextLayerRefresh)
-        {
-            _nextLayerRefresh = Time.unscaledTime + LayerRefreshSeconds;
-            RefreshLayer();
         }
     }
 
@@ -943,10 +1014,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void UpdateDynamicTemperatures()
     {
+        if (UpdateDynamicTemperaturesGpu()) return;
         WorldTile[] tiles = World.world?.tiles_list;
         if (tiles == null || tiles.Length != _cells.Length || tiles.Length == 0) return;
         int count = Math.Min(SolarTilesPerTick, tiles.Length);
-        bool completedPass = _solarCursor + count >= tiles.Length;
         for (int n = 0; n < count; n++)
         {
             int index = (_solarCursor + n) % tiles.Length;
@@ -975,14 +1046,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
             cell.Temperature = Mathf.Lerp(cell.Temperature, targetTemperature, thermalResponse);
             SyncAtmosphere(tile, cell, elapsed);
             UpdateBiomeClimateMemory(cell, elapsed);
-            if (_visibleLayer != ClimateLayer.None)
-                MarkLayerDirtyIndex(index, tile);
         }
         _solarCursor = (_solarCursor + count) % tiles.Length;
-        // 双缓冲式提交：整轮所有源格完成后再应用 delta，避免数组遍历方向让云团
-        // 在同一轮被连续搬运多次而产生固定方向偏差。
-        // 完成一轮后再提交一次本轮 dirty 像素，避免频繁 GPU 上传造成卡顿。
-        if (completedPass && _visibleLayer != ClimateLayer.None) RefreshLayer();
+        // 显示字段与模拟节奏解耦：RefreshDisplayFields 按固定节流周期采样当前状态，
+        // 模拟批次不再直接触发纹理上传。
     }
 
     /// <summary>
@@ -1496,8 +1563,6 @@ public sealed partial class ClimateSystem : MonoBehaviour
                 // ApplyRainfallMoisture 回补目的地，形成可追踪的水循环。
                 float sourceMoistureCost = ocean ? 0.012f :
                     Mathf.Lerp(0.018f, 0.030f, landEvapotranspiration);
-                // Visible clouds represent precipitation already accounted for by the atmosphere.
-                if (_visibleLayer == ClimateLayer.Clouds) MarkLayerDirtyIndex(index, tile);
             }
             if (c.Humidity > 0.68f && c.Temperature > 0.48f &&
                 UnityEngine.Random.value < 0.012f * convection * _ageClimateProfile.StormMultiplier)
@@ -1647,7 +1712,6 @@ public sealed partial class ClimateSystem : MonoBehaviour
         bool ocean = tile.main_type?.ocean == true || tile.Type?.layer_type == TileLayerType.Ocean;
         if (!ocean) amount *= LandRainfallMoistureMultiplier;
         cell.Humidity = Mathf.Min(0.98f, cell.Humidity + amount);
-        if (_visibleLayer == ClimateLayer.Humidity) MarkLayerDirty(tile);
     }
 
     private bool IsCoastal(WorldTile tile)
@@ -1857,7 +1921,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         bool success = tile.top_type?.id == top.id && tile.Type?.biome_asset?.id == wanted;
         if (!success) return false;
         changed = true;
-        MarkLayerDirtyIndex(index, tile);
+        Fields?.MarkSurfaceDirty();
         ApplyPolarFreezing(tile, cell);
         return true;
     }
@@ -2061,8 +2125,11 @@ public sealed partial class ClimateSystem : MonoBehaviour
         // WorldBox 的滚动/模态窗口由独立 Canvas 绘制；本模组的 OnGUI 层级在其后。
         // 任意窗口打开时暂停全部覆盖层，避免夜幕、图层和提示框压暗弹窗。
         if (ClimateUiLayout.NativePopupVisible) return;
-        DrawClimateOverlay();
-        if (!_showPanel) return;
+        Bench.bench("mod.OnGUI", "cpu");
+        Bench.bench("mod.OverlayText", "cpu");
+        DrawOverlayText();
+        Bench.benchEnd("mod.OverlayText", "cpu", false, 0);
+        if (!_showPanel) { Bench.benchEnd("mod.OnGUI", "cpu", false, 0); return; }
         Matrix4x4 previousMatrix=GUI.matrix;
         GUI.BeginGroup(ClimateUiLayout.Gameplay);
         float panelScale=ClimateUiLayout.PanelScale;
@@ -2127,14 +2194,19 @@ public sealed partial class ClimateSystem : MonoBehaviour
             _longitudeMaxDegrees, _longitudeMinDegrees + 10f, 180f));
         TrackCoordinateSliderInteraction();
         }
-        finally { GUI.matrix=previousMatrix; GUI.EndGroup(); }
+        finally { GUI.matrix=previousMatrix; GUI.EndGroup(); Bench.benchEnd("mod.OnGUI", "cpu", false, 0); }
     }
 
     internal bool IsPointerOnClimatePanel => _showPanel && ClimateUiLayout.PointerInPanel;
-
-    private void DrawClimateOverlay()
+    /// <summary>
+    /// IMGUI 只保留文字类覆盖内容：图例、经纬标签、气压带标注与悬停提示框。
+    /// 地图上的全部图形（图层纹理、夜幕、等压线、风尾迹、参考线）已由
+    /// ClimateLayerRenderer 的世界空间渲染体绘制。
+    /// </summary>
+    private void DrawOverlayText()
     {
-        // Window compositor draws these layers with the same clipped projection.
+        // 回绕窗口合成时地图由切片相机呈现，世界空间图层随之进入各分片；
+        // 文字标注跟随主投影没有意义，仅保留提示框。
         if (HorizontalCameraWrap.Active?.Running == true)
         {
             if (_visibleLayer != ClimateLayer.None)
@@ -2146,47 +2218,47 @@ public sealed partial class ClimateSystem : MonoBehaviour
         }
         Camera camera = Camera.main;
         if (camera == null) return;
+        Rect mapRect = ComputeMapRect(camera);
+        if (mapRect.width <= 1f || mapRect.height <= 1f) return;
+        GUI.depth = 1000;
 
-        // 将地图的左下角和右上角投影到屏幕。GUI 坐标原点在左上，
-        // WorldToScreenPoint 原点在左下，因此需要翻转屏幕 Y 坐标。
+        if (_visibleLayer == ClimateLayer.Temperature)
+        {
+            DrawLatitudeLongitudeLabels(mapRect);
+            DrawSubsolarLabel(mapRect);
+        }
+        if (_visibleLayer == ClimateLayer.Wind) DrawWindBeltLabels(mapRect);
+        if (_visibleLayer == ClimateLayer.None) return;
+
+        DrawLegend();
+        Rect interactiveMapRect = IntersectRects(mapRect, ClimateUiLayout.Gameplay);
+        DrawMouseClimateTooltip(camera, interactiveMapRect);
+    }
+
+    private static Rect ComputeMapRect(Camera camera)
+    {
+        // 地图左下角与右上角投影到屏幕；GUI 原点在左上，需要翻转屏幕 Y。
         Vector3 bottomLeft = camera.WorldToScreenPoint(new Vector3(0f, 0f, 0f));
         Vector3 topRight = camera.WorldToScreenPoint(new Vector3(MapBox.width, MapBox.height, 0f));
         float left = Mathf.Min(bottomLeft.x, topRight.x);
         float right = Mathf.Max(bottomLeft.x, topRight.x);
         float top = Screen.height - Mathf.Max(bottomLeft.y, topRight.y);
         float bottom = Screen.height - Mathf.Min(bottomLeft.y, topRight.y);
-        Rect mapRect = new Rect(left, top, right - left, bottom - top);
-        if (mapRect.width <= 1f || mapRect.height <= 1f) return;
+        return new Rect(left, top, right - left, bottom - top);
+    }
 
-        GUI.depth = 1000;
-        Rect gameplayViewport = GetGameplayViewport();
-        // 所有地图视觉层都限制在操作界面上方。BeginGroup 提供真正的裁剪，
-        // 不会压缩纹理或改变地图与纹理之间的坐标对应关系。
-        GUI.BeginGroup(gameplayViewport);
-        if (_visibleLayer == ClimateLayer.Wind && AtmosphereReady)
-        {
-            RefreshPressureDisplay(mapRect.width);
-            if (_pressureTexture != null) GUI.DrawTexture(mapRect, _pressureTexture, ScaleMode.StretchToFill, true);
-        }
-        else if (_visibleLayer != ClimateLayer.None && _layerTexture != null)
-            GUI.DrawTexture(mapRect, _layerTexture, ScaleMode.StretchToFill, true);
+    private static Rect IntersectRects(Rect a, Rect b)
+    {
+        float xMin = Mathf.Max(a.xMin, b.xMin);
+        float yMin = Mathf.Max(a.yMin, b.yMin);
+        float xMax = Mathf.Min(a.xMax, b.xMax);
+        float yMax = Mathf.Min(a.yMax, b.yMax);
+        return xMax <= xMin || yMax <= yMin ? new Rect(0f, 0f, 0f, 0f) :
+            Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+    }
 
-        DrawRotatingNight(mapRect);
-        if (_visibleLayer == ClimateLayer.Temperature)
-        {
-            DrawLatitudeLongitudeGrid(mapRect);
-            DrawSubsolarPoint(mapRect);
-        }
-        if (_visibleLayer == ClimateLayer.Wind)
-        {
-            DrawWindBeltGuides(mapRect);
-            DrawWindTrails(camera, mapRect);
-        }
-        GUI.EndGroup();
-
-        if (_visibleLayer == ClimateLayer.None) return;
-
-        // 固定图例，便于确认图层确实开启以及颜色含义。
+    private void DrawLegend()
+    {
         Rect legend = new Rect(305, 82, 190, 42);
         string legendText = _visibleLayer == ClimateLayer.AirHumidity ? "空气相对湿度：橙（干）→ 蓝（湿）" :
             _visibleLayer == ClimateLayer.Rainfall ? "降水：橙（无）→ 蓝（强）；F7切换" :
@@ -2200,367 +2272,45 @@ public sealed partial class ClimateSystem : MonoBehaviour
                     ? "等高：蓝（水深）→ 绿（低地）→ 白（峰顶）"
                     : "气压：蓝（低）→ 红（高）；流线随风移动";
         GUI.Box(legend, legendText);
-        Rect interactiveMapRect = IntersectRects(mapRect, gameplayViewport);
-        DrawMouseClimateTooltip(camera, interactiveMapRect);
     }
 
-    private void DrawWindArrows(Camera camera, Rect mapRect)
-    {
-        // 按屏幕尺寸而不是地图格数控制密度，缩放地图时仍保持清晰间距。
-        int columns = Mathf.Clamp(Mathf.RoundToInt(mapRect.width / 82f), 8, 16);
-        int rows = Mathf.Clamp(Mathf.RoundToInt(mapRect.height / 82f), 6, 14);
-        float stepX = MapBox.width / (float)columns;
-        float stepY = MapBox.height / (float)rows;
-        Color oldColor = GUI.color;
-        Matrix4x4 oldMatrix = GUI.matrix;
-        for (int row = 0; row < rows; row++)
-        for (int column = 0; column < columns; column++)
-        {
-            int x = Mathf.Clamp(Mathf.FloorToInt((column + 0.5f) * stepX), 0, MapBox.width - 1);
-            int y = Mathf.Clamp(Mathf.FloorToInt((row + 0.5f) * stepY), 0, MapBox.height - 1);
-            if (!TryGetDisplayWind(x, y, out Vector2 wind, out float speed)) continue;
-            Vector3 projected = camera.WorldToScreenPoint(new Vector3(x + 0.5f, y + 0.5f, 0f));
-            Vector2 pivot = new Vector2(projected.x, Screen.height - projected.y);
-            if (!mapRect.Contains(pivot)) continue;
-            // Unity 世界 Y 向上，而 IMGUI 屏幕 Y 向下。
-            Vector2 screenDirection = new Vector2(wind.x, -wind.y).normalized;
-            float length = Mathf.Lerp(17f, 34f, Mathf.Clamp01(speed));
-            Color arrowColor = Color.Lerp(
-                new Color(0.48f, 0.88f, 1f, 0.88f),
-                new Color(1f, 1f, 1f, 1f), Mathf.Clamp01(speed));
-            DrawOutlinedWindArrow(pivot, screenDirection, length, arrowColor);
-        }
-        GUI.matrix = oldMatrix;
-        GUI.color = oldColor;
-    }
-
-    private void DrawWindBeltGuides(Rect mapRect)
-    {
-        Color previousColor = GUI.color;
-        float declination = CurrentSolarDeclinationRadians() * Mathf.Rad2Deg;
-        float itcz = declination * 0.65f;
-        float subtropicalShift = declination * 0.24f;
-        float subpolarShift = declination * 0.14f;
-        DrawWindBeltGuide(mapRect, itcz, "赤道低压带", 0);
-        DrawWindBeltGuide(mapRect, 30f + subtropicalShift, "副热带高压带", 1);
-        DrawWindBeltGuide(mapRect, -30f + subtropicalShift, "副热带高压带", 1);
-        DrawWindBeltGuide(mapRect, 60f + subpolarShift, "副极地低压带", 2);
-        DrawWindBeltGuide(mapRect, -60f + subpolarShift, "副极地低压带", 2);
-        GUI.color = previousColor;
-    }
-
-    private void DrawWindBeltGuide(Rect mapRect, float latitude, string name, int kind)
-    {
-        if (latitude < _latitudeMinDegrees || latitude > _latitudeMaxDegrees) return;
-        float normalizedY = LatitudeDegreesToMapY(latitude);
-        float y = mapRect.y + (1f - normalizedY) * mapRect.height;
-        GUI.color = kind == 0
-            ? new Color(0.95f, 0.30f, 0.18f, 0.60f)
-            : kind == 1
-                ? new Color(0.92f, 0.36f, 0.78f, 0.46f)
-                : new Color(0.94f, 0.72f, 0.30f, 0.42f);
-        GUI.DrawTexture(new Rect(mapRect.x, y, mapRect.width, kind == 0 ? 2f : 1f),
-            Texture2D.whiteTexture);
-        string hemisphere = latitude < -0.05f ? "S" : latitude > 0.05f ? "N" : "";
-        GUI.color = new Color(1f, 1f, 1f, 0.88f);
-        GUI.Label(new Rect(mapRect.x + 5f, y - 18f, 170f, 20f),
-            $"{Mathf.Abs(latitude):F1}°{hemisphere}  {name}");
-    }
-
-    private bool TryGetDisplayWind(int centerX, int centerY, out Vector2 wind, out float speed)
-    {
-        Vector2 sum = Vector2.zero;
-        float speedSum = 0f;
-        float weightSum = 0f;
-        for (int oy = -1; oy <= 1; oy++)
-        for (int ox = -1; ox <= 1; ox++)
-        {
-            int x = centerX + ox;
-            int y = centerY + oy;
-            if (x < 0 || y < 0 || x >= MapBox.width || y >= MapBox.height) continue;
-            int pixel = y * MapBox.width + x;
-            if (pixel < 0 || pixel >= _cellIndexByPixel.Length) continue;
-            int index = _cellIndexByPixel[pixel];
-            if (index < 0 || index >= _cells.Length) continue;
-            ClimateCell cell = _cells[index];
-            float weight = ox == 0 && oy == 0 ? 2f : ox == 0 || oy == 0 ? 1f : 0.7f;
-            sum += cell.Wind * Mathf.Lerp(0.35f, 1f, cell.WindSpeed) * weight;
-            speedSum += cell.WindSpeed * weight;
-            weightSum += weight;
-        }
-        speed = weightSum > 0f ? speedSum / weightSum : 0f;
-        wind = sum.sqrMagnitude > 0.0001f ? sum.normalized : Vector2.zero;
-        return weightSum > 0f && wind.sqrMagnitude > 0.0001f;
-    }
-
-    private static void DrawOutlinedWindArrow(Vector2 center, Vector2 direction,
-        float length, Color color)
-    {
-        Vector2 start = center - direction * length * 0.44f;
-        Vector2 end = center + direction * length * 0.44f;
-        Vector2 perpendicular = new Vector2(-direction.y, direction.x);
-        float headLength = Mathf.Clamp(length * 0.30f, 6f, 10f);
-        float headWidth = headLength * 0.52f;
-        Vector2 headBase = end - direction * headLength;
-        Vector2 headA = headBase + perpendicular * headWidth;
-        Vector2 headB = headBase - perpendicular * headWidth;
-        Color outline = new Color(0.025f, 0.08f, 0.14f, 0.90f);
-
-        DrawGuiLine(start, end, 4.5f, outline);
-        DrawGuiLine(end, headA, 4.5f, outline);
-        DrawGuiLine(end, headB, 4.5f, outline);
-        DrawGuiLine(start, end, 2.0f, color);
-        DrawGuiLine(end, headA, 2.0f, color);
-        DrawGuiLine(end, headB, 2.0f, color);
-    }
-
-    private static void DrawGuiLine(Vector2 start, Vector2 end, float width, Color color)
-    {
-        Vector2 delta = end - start;
-        float length = delta.magnitude;
-        if (length < 0.01f) return;
-        Matrix4x4 previousMatrix = GUI.matrix;
-        Color previousColor = GUI.color;
-        float angle = Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg;
-        GUIUtility.RotateAroundPivot(angle, start);
-        GUI.color = color;
-        GUI.DrawTexture(new Rect(start.x, start.y - width * 0.5f, length, width), Texture2D.whiteTexture);
-        GUI.matrix = previousMatrix;
-        GUI.color = previousColor;
-    }
-
-    private static Rect GetGameplayViewport()
-    {
-        // WorldBox 底部工具栏随 UI 缩放变化；按屏幕高度估算并限制上下界。
-        return ClimateUiLayout.Gameplay;
-    }
-
-    private static Rect IntersectRects(Rect a, Rect b)
-    {
-        float xMin = Mathf.Max(a.xMin, b.xMin);
-        float yMin = Mathf.Max(a.yMin, b.yMin);
-        float xMax = Mathf.Min(a.xMax, b.xMax);
-        float yMax = Mathf.Min(a.yMax, b.yMax);
-        return xMax <= xMin || yMax <= yMin ? new Rect(0f, 0f, 0f, 0f) :
-            Rect.MinMaxRect(xMin, yMin, xMax, yMax);
-    }
-
-    private void DrawRotatingNight(Rect mapRect)
-    {
-        if (_nightTexture == null) return;
-        if (Time.unscaledTime >= _nextNightRefresh)
-        {
-            _nextNightRefresh = Time.unscaledTime + NightTextureRefreshSeconds;
-            RefreshAstronomicalNightTexture();
-        }
-        GUI.DrawTexture(mapRect, _nightTexture, ScaleMode.StretchToFill, true);
-    }
-
-    private void RefreshAstronomicalNightTexture()
-    {
-        int width = _nightTexture.width;
-        int height = _nightTexture.height;
-        float declination = CurrentSolarDeclinationRadians();
-        float subsolarLongitude = CurrentSubsolarLongitudeRadians();
-        float sinDeclination = Mathf.Sin(declination);
-        float cosDeclination = Mathf.Cos(declination);
-        float maxNightAlpha = GetDarkAgeOverlayAlpha();
-        float atmosphericDayDim = Mathf.Clamp01(1f - SurfaceLightTransmission()) * 0.55f;
-        for (int x = 0; x < width; x++)
-        {
-            float longitude = LongitudeRadiansAt((x + 0.5f) / width * Math.Max(1f, MapBox.width - 1f));
-            _nightCosHourAngles[x] = Mathf.Cos(longitude - subsolarLongitude);
-        }
-        for (int y = 0; y < height; y++)
-        {
-            float mapY = (y + 0.5f) / height * Math.Max(1, MapBox.height - 1);
-            float latitude = GetSignedLatitude(mapY) * Mathf.PI * 0.5f;
-            _nightSinLatitudes[y] = Mathf.Sin(latitude);
-            _nightCosLatitudes[y] = Mathf.Cos(latitude);
-        }
-        for (int y = 0; y < height; y++)
-        {
-            float sinLat = _nightSinLatitudes[y];
-            float cosLat = _nightCosLatitudes[y];
-            for (int x = 0; x < width; x++)
-            {
-                // 标准太阳高度角公式。极昼时整日 > 0，极夜时整日 < 0。
-                float sinAltitude = sinLat * sinDeclination +
-                                    cosLat * cosDeclination * _nightCosHourAngles[x];
-                // 太阳高度低于地平线后逐步进入夜色，保留柔和晨昏带。
-                float darkness01 = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01((-sinAltitude + 0.02f) / 0.28f));
-                // 最大暗度直接采用原版黑暗纪元资产参数，不再维护独立手写值。
-                float nightAlpha = darkness01 * maxNightAlpha;
-                // 厚于类地的大气会削弱白昼可见光；与夜幕按透明度合成，避免重复变暗。
-                float dayAlpha = (1f - darkness01) * atmosphericDayDim;
-                float combinedAlpha = 1f - (1f - nightAlpha) * (1f - dayAlpha);
-                byte alpha = (byte)Mathf.RoundToInt(combinedAlpha * 255f);
-                _nightPixels[y * width + x] = new Color32(4, 7, 22, alpha);
-            }
-        }
-        PreserveOriginalBuildingLights(width, height);
-        PreserveOriginalLavaLights(width, height);
-        _nightTexture.SetPixels32(_nightPixels);
-        _nightTexture.Apply(false, false);
-    }
-
-    private static float GetDarkAgeOverlayAlpha()
-    {
-        // 当前纪元本身已有原版全局暗幕时，不再叠加局地夜幕；建筑灯光仍由
-        // WorldAgeManager 和 IsNightAt 使用原版逻辑显示，避免黑暗纪元被压暗两次。
-        if (World.world?.era_manager?.getCurrentAge()?.overlay_darkness == true) return 0f;
-        WorldAgeAsset darkAge = AssetManager.era_library?.get("age_dark");
-        float layerAlpha = darkAge == null ? 0.30f : Mathf.Clamp01(darkAge.era_effect_overlay_alpha);
-        // 原版 WorldAgeEffects 同时作用于 top 与 material 两个夜色通道。
-        // 屏幕空间单纹理使用两层 Alpha 合成后的等效值，才能匹配黑暗纪元观感。
-        return 1f - (1f - layerAlpha) * (1f - layerAlpha);
-    }
-
-    private void PreserveOriginalBuildingLights(int width, int height)
-    {
-        if (World.world?.buildings == null) return;
-        foreach (Building building in World.world.buildings)
-        {
-            if (building == null || building.asset == null || building.current_tile == null) continue;
-            BuildingAsset asset = building.asset;
-            // 与原版 BatchBuildings/LightRenderer 完全相同的准入字段：
-            // draw_light_area=false 的建筑绝不创建透光罩。
-            if (!asset.draw_light_area || asset.draw_light_size <= 0f) continue;
-            if (!IsNightAt(building.current_tile)) continue;
-            float lightWorldX = building.current_tile.pos.x + 0.5f + asset.draw_light_area_offset_x;
-            float lightWorldY = building.current_tile.pos.y + 0.5f + asset.draw_light_area_offset_y;
-            int centerX = Mathf.RoundToInt(lightWorldX / Math.Max(1, MapBox.width - 1) * (width - 1));
-            int centerY = Mathf.RoundToInt(lightWorldY / Math.Max(1, MapBox.height - 1) * (height - 1));
-            int radiusX = Mathf.Clamp(Mathf.CeilToInt(asset.draw_light_size / Math.Max(1, MapBox.width) * width), 1, 12);
-            int radiusY = Mathf.Clamp(Mathf.CeilToInt(asset.draw_light_size / Math.Max(1, MapBox.height) * height), 1, 12);
-            // 只降低原版光源覆盖区域的夜幕透明度；偏移和半径均来自原版资产。
-            for (int offsetY = -radiusY; offsetY <= radiusY; offsetY++)
-            for (int offsetX = -radiusX; offsetX <= radiusX; offsetX++)
-            {
-                int px = centerX + offsetX;
-                int py = centerY + offsetY;
-                if (px < 0 || py < 0 || px >= width || py >= height) continue;
-                float normalizedDistance = Mathf.Sqrt(
-                    (offsetX / (float)radiusX) * (offsetX / (float)radiusX) +
-                    (offsetY / (float)radiusY) * (offsetY / (float)radiusY));
-                if (normalizedDistance > 1f) continue;
-                int index = py * width + px;
-                Color32 color = _nightPixels[index];
-                float passThrough = Mathf.Lerp(0.06f, 0.82f, normalizedDistance);
-                color.a = (byte)Mathf.RoundToInt(color.a * passThrough);
-                _nightPixels[index] = color;
-            }
-        }
-    }
-
-    private void PreserveOriginalLavaLights(int width, int height)
-    {
-        // 四级岩浆本身使用原版 mat_world_object_lit；这里只在自转夜幕中保留该原版
-        // 发光材质的可见度，不创建新光源，也不改变岩浆颜色或 LavaRenderer。
-        PreserveLavaTypeLights(TileLibrary.lava0, width, height);
-        PreserveLavaTypeLights(TileLibrary.lava1, width, height);
-        PreserveLavaTypeLights(TileLibrary.lava2, width, height);
-        PreserveLavaTypeLights(TileLibrary.lava3, width, height);
-    }
-
-    private void PreserveLavaTypeLights(TileType lavaType, int width, int height)
-    {
-        if (lavaType?.hashset == null || lavaType.hashset.Count == 0) return;
-        float heat01 = Mathf.Clamp01((lavaType.lava_level + 1f) / 4f);
-        int radius = lavaType.lava_level >= 2 ? 2 : 1;
-        foreach (WorldTile tile in lavaType.hashset)
-        {
-            if (tile == null) continue;
-            if (!IsNightAt(tile)) continue;
-            int centerX = Mathf.RoundToInt((tile.pos.x + 0.5f) / Math.Max(1, MapBox.width) * (width - 1));
-            int centerY = Mathf.RoundToInt((tile.pos.y + 0.5f) / Math.Max(1, MapBox.height) * (height - 1));
-            for (int offsetY = -radius; offsetY <= radius; offsetY++)
-            for (int offsetX = -radius; offsetX <= radius; offsetX++)
-            {
-                int px = centerX + offsetX;
-                int py = centerY + offsetY;
-                if (px < 0 || py < 0 || px >= width || py >= height) continue;
-                float distance = Mathf.Sqrt(offsetX * offsetX + offsetY * offsetY) / Mathf.Max(1f, radius);
-                if (distance > 1f) continue;
-                int index = py * width + px;
-                Color32 color = _nightPixels[index];
-                float corePass = Mathf.Lerp(0.30f, 0.07f, heat01);
-                float passThrough = Mathf.Lerp(corePass, 0.86f, distance);
-                color.a = (byte)Mathf.RoundToInt(color.a * passThrough);
-                _nightPixels[index] = color;
-            }
-        }
-    }
-
-    private float CurrentSolarDeclinationRadians()
-    {
-        float yearPhase = (_seasonClock / (SeasonSeconds * 4f)) * Mathf.PI * 2f;
-        return 23.44f * Mathf.Deg2Rad * Mathf.Sin(yearPhase);
-    }
-
-    private float CurrentSubsolarLongitudeRadians()
-    {
-        // 与季节和热惯性共用同一模拟时钟，暂停及速度变化时保持相位一致。
-        return Mathf.PI * 0.5f + _seasonClock * 0.035f;
-    }
-
-    private void DrawLatitudeLongitudeGrid(Rect mapRect)
+    private void DrawLatitudeLongitudeLabels(Rect mapRect)
     {
         Color oldColor = GUI.color;
-        int longitudeStart = Mathf.CeilToInt(_longitudeMinDegrees / 30f) * 30;
-        int longitudeEnd = Mathf.FloorToInt(_longitudeMaxDegrees / 30f) * 30;
-        for (int longitude = longitudeStart; longitude <= longitudeEnd; longitude += 30)
+        for (int longitude = Mathf.CeilToInt(_longitudeMinDegrees / 30f) * 30;
+             longitude <= _longitudeMaxDegrees; longitude += 30)
         {
-            float normalizedX = Mathf.InverseLerp(_longitudeMinDegrees, _longitudeMaxDegrees, longitude);
-            float x = mapRect.x + normalizedX * mapRect.width;
-            GUI.color = new Color(1f, 1f, 1f, longitude == 0 ? 0.46f : 0.22f);
-            GUI.DrawTexture(new Rect(x, mapRect.y, longitude == 0 ? 2f : 1f, mapRect.height), Texture2D.whiteTexture);
-            if (longitude % 60 == 0)
-            {
-                string suffix = longitude < 0 ? "W" : longitude > 0 ? "E" : "";
-                GUI.color = new Color(1f, 1f, 1f, 0.82f);
-                GUI.Label(new Rect(x + 3f, mapRect.y + 2f, 54f, 20f), $"{Mathf.Abs(longitude)}°{suffix}");
-            }
+            if (longitude % 60 != 0) continue;
+            float x = mapRect.x + Mathf.InverseLerp(_longitudeMinDegrees, _longitudeMaxDegrees, longitude) * mapRect.width;
+            string suffix = longitude < 0 ? "W" : longitude > 0 ? "E" : "";
+            GUI.color = new Color(1f, 1f, 1f, 0.82f);
+            GUI.Label(new Rect(x + 3f, mapRect.y + 2f, 54f, 20f), $"{Mathf.Abs(longitude)}°{suffix}");
         }
-
-        int latitudeStart = Mathf.CeilToInt(_latitudeMinDegrees / 30f) * 30;
-        int latitudeEnd = Mathf.FloorToInt(_latitudeMaxDegrees / 30f) * 30;
-        for (int latitude = latitudeStart; latitude <= latitudeEnd; latitude += 30)
+        for (int latitude = Mathf.CeilToInt(_latitudeMinDegrees / 30f) * 30;
+             latitude <= _latitudeMaxDegrees; latitude += 30)
         {
-            float normalizedY = LatitudeDegreesToMapY(latitude);
-            float y = mapRect.y + (1f - normalizedY) * mapRect.height;
-            bool equator = latitude == 0;
-            GUI.color = equator ? new Color(1f, 0.82f, 0.18f, 0.72f) : new Color(1f, 1f, 1f, 0.28f);
-            GUI.DrawTexture(new Rect(mapRect.x, y, mapRect.width, equator ? 2f : 1f), Texture2D.whiteTexture);
+            float y = mapRect.y + (1f - LatitudeDegreesToMapY(latitude)) * mapRect.height;
             string suffix = latitude < 0 ? "S" : latitude > 0 ? "N" : "赤道";
             string label = latitude == 0 ? suffix : $"{Mathf.Abs(latitude)}°{suffix}";
-            GUI.color = equator ? new Color(1f, 0.88f, 0.28f, 0.95f) : new Color(1f, 1f, 1f, 0.86f);
+            GUI.color = latitude == 0 ? new Color(1f, 0.88f, 0.28f, 0.95f) : new Color(1f, 1f, 1f, 0.86f);
             GUI.Label(new Rect(mapRect.x + 4f, y - 19f, 62f, 20f), label);
         }
         GUI.color = oldColor;
     }
 
-    private void DrawSubsolarPoint(Rect mapRect)
+    private void DrawSubsolarLabel(Rect mapRect)
     {
         float latitudeDegrees = CurrentSolarDeclinationRadians() * Mathf.Rad2Deg;
         float normalizedY = LatitudeDegreesToMapY(latitudeDegrees);
         bool insideLatitude = latitudeDegrees >= _latitudeMinDegrees && latitudeDegrees <= _latitudeMaxDegrees;
-
-        // 与温度模型中的移动日照波保持一致，标出当前最强日照经度。
         float solarLongitude = NormalizeLongitudeDegrees(CurrentSubsolarLongitudeRadians() * Mathf.Rad2Deg);
         bool insideLongitude = TryLongitudeDegreesToMapX(solarLongitude, out float normalizedX);
         float screenX = mapRect.x + normalizedX * mapRect.width;
         float screenY = mapRect.y + (1f - normalizedY) * mapRect.height;
 
-        Color oldColor = GUI.color;
-        GUI.color = new Color(1f, 0.92f, 0.05f, 0.95f);
-        GUI.DrawTexture(new Rect(screenX - 12f, screenY - 2f, 24f, 4f), Texture2D.whiteTexture);
-        GUI.DrawTexture(new Rect(screenX - 2f, screenY - 12f, 4f, 24f), Texture2D.whiteTexture);
-        GUI.color = oldColor;
-
-        float degrees = Mathf.Abs(CurrentSolarDeclinationRadians() * Mathf.Rad2Deg);
+        float degrees = Mathf.Abs(latitudeDegrees);
         string hemisphere = degrees < 0.05f ? "赤道" :
-            CurrentSolarDeclinationRadians() > 0f ? $"北纬 {degrees:F1}°" : $"南纬 {degrees:F1}°";
+            latitudeDegrees > 0f ? $"北纬 {degrees:F1}°" : $"南纬 {degrees:F1}°";
         string label = insideLatitude && insideLongitude
             ? $"☀ 太阳直射点  {hemisphere}"
             : $"☀ 直射点在范围外  {hemisphere}";
@@ -2569,8 +2319,30 @@ public sealed partial class ClimateSystem : MonoBehaviour
         GUI.Box(new Rect(labelX, labelY, 176f, 25f), label);
     }
 
+    private void DrawWindBeltLabels(Rect mapRect)
+    {
+        float declination = CurrentSolarDeclinationRadians() * Mathf.Rad2Deg;
+        DrawWindBeltLabel(mapRect, declination * 0.65f, "赤道低压带");
+        DrawWindBeltLabel(mapRect, 30f + declination * 0.24f, "副热带高压带");
+        DrawWindBeltLabel(mapRect, -30f + declination * 0.24f, "副热带高压带");
+        DrawWindBeltLabel(mapRect, 60f + declination * 0.14f, "副极地低压带");
+        DrawWindBeltLabel(mapRect, -60f + declination * 0.14f, "副极地低压带");
+    }
+
+    private void DrawWindBeltLabel(Rect mapRect, float latitude, string name)
+    {
+        if (latitude < _latitudeMinDegrees || latitude > _latitudeMaxDegrees) return;
+        float y = mapRect.y + (1f - LatitudeDegreesToMapY(latitude)) * mapRect.height;
+        GUI.color = new Color(1f, 1f, 1f, 0.88f);
+        GUI.Label(new Rect(mapRect.x + 5f, y - 18f, 170f, 20f),
+            $"{Mathf.Abs(latitude):F1}°{(latitude < -0.05f ? "S" : latitude > 0.05f ? "N" : "")}  {name}");
+    }
+
     private void DrawMouseClimateTooltip(Camera camera, Rect mapRect)
     {
+        // 悬停原版 UI（含本模组面板，经 isOverUI 补丁）时不画地图提示框，
+        // 避免与原版提示框叠在一起；只有指向地图本身时才显示。
+        if (World.world?.isOverUI() == true) return;
         Vector2 mouseGui = Event.current.mousePosition;
         if (!mapRect.Contains(mouseGui)) return;
         Vector3 mouseScreen = new Vector3(mouseGui.x, Screen.height - mouseGui.y, 0f);

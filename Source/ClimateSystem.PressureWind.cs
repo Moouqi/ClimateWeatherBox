@@ -110,13 +110,6 @@ public sealed partial class ClimateSystem
         float responseSeconds = ocean ? 115f : 48f;
         float response = 1f - Mathf.Exp(-elapsed / responseSeconds);
         cell.Pressure = immediate || previous <= 0f ? target : Mathf.Lerp(previous, target, response);
-        if (_visibleLayer != ClimateLayer.Wind || Mathf.Abs(cell.Pressure - previous) < 0.05f) return;
-        int pixel = tile.pos.y * MapBox.width + tile.pos.x;
-        MarkLayerDirtyPixel(pixel);
-        MarkLayerDirtyPixel(pixel - 1);
-        MarkLayerDirtyPixel(pixel + 1);
-        MarkLayerDirtyPixel(pixel - MapBox.width);
-        MarkLayerDirtyPixel(pixel + MapBox.width);
     }
 
     private float PressureAt(int x, int y, float fallback)
@@ -132,10 +125,12 @@ public sealed partial class ClimateSystem
 
     private void CalculateWind(WorldTile tile, ClimateCell cell, bool immediate)
     {
+        // GPU 地表温度管线接管时，风/气压/云量由内核按节拍同步进 cells；
+        // 这里再用过期的 CPU 大气快照同步只会覆盖较新的值。
+        if (SurfaceThermalActive) return;
         if (AtmosphereReady && tile != null && cell != null)
         {
             SyncAtmosphere(tile, cell, 0f);
-            if (_visibleLayer == ClimateLayer.Wind) MarkLayerDirty(tile);
             return;
         }
         if (tile == null || cell == null || _cellIndexByPixel.Length == 0) return;
@@ -195,7 +190,6 @@ public sealed partial class ClimateSystem
             blendedDirection = (blendedDirection + pressureGradient.normalized * 0.85f).normalized;
         cell.Wind = blendedDirection;
         cell.WindSpeed = Mathf.Lerp(cell.WindSpeed, speed, blend);
-        if (_visibleLayer == ClimateLayer.Wind) MarkLayerDirty(tile);
     }
 
     private static Vector2 GlobalWindBelt(float signedLatitude, out float strength)

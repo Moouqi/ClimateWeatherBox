@@ -757,5 +757,6 @@ public sealed partial class ClimateSystem
         float[] old=_riverMoistureField;
         _riverMoistureField=builder.Result;
         builder.RecycleOutput(old);
+        MarkThermalRiverMoistureDirty();
     }
 }
