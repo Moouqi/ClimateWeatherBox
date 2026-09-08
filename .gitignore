@@ -9,3 +9,7 @@ obj/
 .vs/
 .idea/
 *.user
+
+# Unity AssetBundle 构建附带的文件夹级产物
+Gpu/Gpu
+Gpu/Gpu.manifest

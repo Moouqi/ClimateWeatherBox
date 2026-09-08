@@ -1,0 +1,26 @@
+ManifestFileVersion: 0
+CRC: 222416715
+Hashes:
+  AssetFileHash:
+    serializedVersion: 2
+    Hash: 36800ea8765eb7c24060dbd87da456ca
+  TypeTreeHash:
+    serializedVersion: 2
+    Hash: cc47f627a82a59fd500d95464fa77bad
+  IncrementalBuildHash:
+    serializedVersion: 2
+    Hash: 36800ea8765eb7c24060dbd87da456ca
+HashAppended: 0
+ClassTypes:
+- Class: 48
+  Script: {instanceID: 0}
+- Class: 72
+  Script: {instanceID: 0}
+SerializeReferenceClassIdentifiers: []
+Assets:
+- Assets/ClimateLayers.shader
+- Assets/ClimateLines.shader
+- Assets/ClimateAtmosphere.compute
+- Assets/SurfaceThermal.compute
+- Assets/ClimateNight.shader
+Dependencies: []
