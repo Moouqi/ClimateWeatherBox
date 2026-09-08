@@ -168,7 +168,6 @@ public sealed class HorizontalSeamPreview : MonoBehaviour
         try
         {
             GUI.DrawTexture(new Rect(0,0,pane.width,pane.height),scene,ScaleMode.StretchToFill,false);
-            ClimateSystem.Active?.DrawPreviewLayers(map);
         }
         finally { GUI.EndGroup(); }
     }

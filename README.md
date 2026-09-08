@@ -43,12 +43,27 @@
 - 温度可在面板切换摄氏（°C）或华氏（°F）并持久保存；内部 0–1 气候温度映射为 -50°C 至 50°C。
 - 冻土群系核心适生线为约 −5°C，并优先于干旱沙漠判断；已有冻土可在约 2°C 以下保持，以形成稳定的过渡带。冬季低温区会随温度场向赤道推进，回暖后再恢复当地适生群系。
 - 地块气候采用带交错边缘的赤道波前刷新：按自定义纬度到赤道的实际距离排序，从范围内最接近赤道的一侧向高纬推进；同纬度地块加入确定性微小错位，避免整行批量变化形成横向条带。每 5 秒集中判定最多 4096 格，所有地块都会完成适生性与持续时间检查；成熟的群系变化进入全图去重队列，再按每周期最多 192 格执行。预算耗尽只会延后写入，不再跳过或遗失后续地块。
-- 区域黑夜复用黑暗纪元的 `WorldAgeManager.shouldShowLights`、`LightRenderer` 和 `LightBlobData` 原版发光链路；仅 `BuildingAsset.draw_light_area=true` 的建筑按原版偏移与半径生成透光罩，不发光建筑不会透光。
-- 原版 `QuantumSpriteLibrary.checkBuildingLights` 在逐建筑提交前按当地太阳高度过滤：白昼建筑不提交灯光，只有进入当地黑夜后才启用原版发光。
+- 区域黑夜的建筑与岩浆光晕由夜幕 shader 的 LightMask 承担：每 0.4 秒遍历具备 `draw_light_area` 的建筑和四档岩浆，在夜幕纹理上保留透光；普通纪元下原版 `light_areas` 光斑经合成后 alpha 恒为 0，整条每帧绘制链路被跳过，黑暗纪元仍走原版光照。
+- 窗户光 sprite 直接渲染在 Objects 层：地图仍存在夜晚时保持原版光照管线开启，`DynamicSprites.getBuildingLight` 按建筑所在地昼夜过滤——白天的建筑不提交窗户光，夜侧建筑保持原版发光效果。
 - 黑夜、温度、湿度和太阳直射点均裁剪在地图游戏视口内，不覆盖底部工具栏、统计栏和纪元操作界面。
 - 检测到任意 `ScrollWindow` 弹窗后暂停绘制全部气候覆盖层与提示框，关闭弹窗时自动恢复。
 
 模组只改普通自然群系，保留腐化、糖果、地狱等特殊群系。频率常量集中在 `ModClass.cs` 顶部，便于二次调整。
+
+## 渲染架构
+
+所有地图视觉（夜幕、数据图层、等压线、等高线、风尾迹、经纬网）由 `Source/Render/` 下的世界空间渲染体绘制：模拟状态写入 `ClimateFieldSet` 的字段纹理，挂在游戏 `MapOverlay` 排序层的两块面片和一个线条 Mesh 用自定义 shader 实时合成画面，一次合成、无需逐帧 GUI 重绘；接缝预览和回绕窗口的副相机自动拍到全部图层。晨昏线、等高带、等压线全部在 shader 内逐像素计算。文字类内容（图例、标签、悬停提示框与 F8 面板）保留 IMGUI。模块说明见 `Source/README.md`。
+
+## GPU 大气与直写显示
+
+大气模拟（风、气压、气温、水汽、云、降水与输运）完整运行在 compute shader 上（`.UnityProject/Assets/ClimateAtmosphere.compute`，与 CPU 实现逐条对应）。kernel 每模拟一秒把气压/风/水汽**直接写入** `AtmosDisplay` 渲染纹理，等压线图层采样该纹理，显示路径零 CPU 回读；异步回读只服务于群系、天气与云生成等玩法逻辑。任何无效数据（NaN、负质量）都会触发自动回退：丢弃 GPU 状态、恢复 CPU 模拟与 CPU 上传纹理，画面无缝切换。
+
+shader 与材质打包在 `Gpu/climatelayers`（Unity 2022.3.60f1 AssetBundle）。资源缺失时模组正常模拟，只记录一条警告且不显示图层。重新构建：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build-shaders.ps1
+# Unity 不在默认路径时： -UnityPath "<路径>\Unity.exe"
+```
 
 ## 安装
 

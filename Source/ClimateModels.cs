@@ -7,6 +7,9 @@ public enum Season { Spring, Summer, Autumn, Winter }
 public enum ClimateTemplate { Global, NorthernHemisphere, SouthernHemisphere }
 public enum TemperatureUnit { Celsius, Fahrenheit }
 
+// 可视化数据图层；F3-F7 切换，渲染顺序见 ClimateLayerRenderer.LayerModeIndex。
+internal enum ClimateLayer { None, Temperature, Humidity, Wind, Elevation, Clouds, AirHumidity, Rainfall }
+
 internal enum TropicalCycloneKind
 {
     TropicalDepression,

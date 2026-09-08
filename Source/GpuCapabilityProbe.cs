@@ -23,8 +23,8 @@ public sealed class GpuCapabilityProbe : MonoBehaviour
                 " AsyncReadback=" + SystemInfo.supportsAsyncGPUReadback);
             if (!SystemInfo.supportsComputeShaders || !SystemInfo.supportsAsyncGPUReadback)
                 throw new NotSupportedException("ComputeShader or async readback unavailable");
-            string path = Path.GetFullPath(Path.Combine(Application.dataPath,
-                "../Mods/ClimateWeather/Gpu/climatecompute"));
+            string path = ClimateShaderAssets.LocateFile("Gpu/climatecompute")
+                ?? throw new IOException("climatecompute bundle not found in Mods directory");
             _bundle = AssetBundle.LoadFromFile(path);
             if (_bundle == null) throw new IOException("Unable to load " + path);
             ComputeShader shader = _bundle.LoadAsset<ComputeShader>("Assets/ClimateProbe.compute");

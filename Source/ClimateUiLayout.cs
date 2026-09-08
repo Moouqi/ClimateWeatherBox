@@ -19,11 +19,11 @@ internal static class ClimateUiLayout
     {
         get
         {
-            if (ScrollWindow.isWindowActive() || ScrollWindow.isAnimationActive() || ScrollWindow._is_any_window_active) return true;
-            if (AchievementPopup._instance != null && AchievementPopup._instance.gameObject.activeInHierarchy) return true;
-            foreach (var tooltip in Tooltip._dict_tooltips.Values)
-                if (tooltip != null && tooltip.gameObject.activeInHierarchy) return true;
-            return false;
+            // 仅在原版窗口打开时隐藏覆盖层。悬停 UI 时的原版提示框由
+            // Screen Space Overlay 画布绘制，永远在世界空间图层之上，
+            // 不需要为此隐藏夜幕、图层或面板。
+            return ScrollWindow.isWindowActive() || ScrollWindow.isAnimationActive() ||
+                   ScrollWindow._is_any_window_active;
         }
     }
     internal static Rect Gameplay

@@ -252,7 +252,6 @@ public sealed class HorizontalCameraWrap : MonoBehaviour
             try
             {
                 GUI.DrawTexture(new Rect(0,0,pane.Screen.width,pane.Screen.height),pane.Texture,ScaleMode.StretchToFill,false);
-                ClimateSystem.Active?.DrawPreviewLayers(pane.Map,pane.Screen.width,pane.Screen.height);
             }
             finally { GUI.EndGroup(); }
         }

@@ -6,6 +6,12 @@ using UnityEngine.Rendering;
 
 namespace ClimateWeather;
 
+/// <summary>
+/// GPU 大气后端：ClimateAtmosphere.compute 每模拟一秒推进一次大气状态，
+/// 同时把气压/风/水汽直写 AtmosDisplay 渲染纹理供图层 shader 采样；
+/// 异步回读只负责把状态交还 CPU 的玩法逻辑（群系、天气、云生成）。
+/// 任何无效数据都会丢弃 GPU 状态并回退到最近一次完整的 CPU 快照。
+/// </summary>
 internal sealed class GpuAtmosphereBackend : IDisposable
 {
     [StructLayout(LayoutKind.Sequential)]
@@ -13,10 +19,9 @@ internal sealed class GpuAtmosphereBackend : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     internal struct Surface { public Vector4 Ground, Geo, Position; }
     private AssetBundle _bundle;
-    private static AssetBundle _sharedBundle;
-    private static int _bundleUsers;
     private ComputeShader _shader;
     private ComputeBuffer _front, _back, _terrain;
+    private RenderTexture _display;
     private int _kernel, _width, _height;
     private bool _disposed;
     internal bool Pending { get; private set; }
@@ -24,6 +29,9 @@ internal sealed class GpuAtmosphereBackend : IDisposable
     internal string Error { get; private set; }
     internal State[] Results { get; private set; }
     internal float ResultTime { get; private set; }
+    internal RenderTexture DisplayTexture => _display;
+    /// <summary>最近一次派发写入的大气状态缓冲，供地表温度内核只读采样。</summary>
+    internal ComputeBuffer LatestStateBuffer => _front;
 
     internal GpuAtmosphereBackend(int width, int height, State[] initial)
     {
@@ -33,17 +41,19 @@ internal sealed class GpuAtmosphereBackend : IDisposable
                 throw new NotSupportedException("GPU compute/async readback unavailable");
             if (Marshal.SizeOf(typeof(State)) != 64 || Marshal.SizeOf(typeof(Surface)) != 48)
                 throw new Exception("GPU structure layout mismatch");
-            if (_sharedBundle == null)
-                _sharedBundle = AssetBundle.LoadFromFile(Path.GetFullPath(Path.Combine(Application.dataPath,
-                    "../Mods/ClimateWeather/Gpu/climateatmosphere")));
-            _bundle = _sharedBundle;
-            if (_bundle == null) throw new IOException("climateatmosphere bundle missing or incompatible");
-            _bundleUsers++;
-            _shader = _bundle.LoadAsset<ComputeShader>("Assets/ClimateAtmosphere.compute");
+            _shader = ClimateShaderAssets.LoadCompute("ClimateAtmosphere");
             if (_shader == null) throw new IOException("ClimateAtmosphere kernel missing");
             _kernel = _shader.FindKernel("Step"); _width = width; _height = height;
             _front = new ComputeBuffer(initial.Length, 64); _back = new ComputeBuffer(initial.Length, 64);
             _terrain = new ComputeBuffer(initial.Length, 48);
+            _display = new RenderTexture(width, height, 0, RenderTextureFormat.ARGBFloat)
+            {
+                name = "ClimateAtmosDisplay",
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp,
+                enableRandomWrite = true,
+            };
+            _display.Create();
             _front.SetData(initial); Results = new State[initial.Length];
         }
         catch { Release(); throw; }
@@ -66,6 +76,7 @@ internal sealed class GpuAtmosphereBackend : IDisposable
             _shader.SetFloat("Seed", seed);
             _shader.SetBuffer(_kernel, "Previous", _front); _shader.SetBuffer(_kernel, "Next", _back);
             _shader.SetBuffer(_kernel, "Terrain", _terrain);
+            _shader.SetTexture(_kernel, "AtmosDisplay", _display);
             _shader.Dispatch(_kernel, (_width + 7) / 8, (_height + 7) / 8, 1);
             ComputeBuffer swap = _front; _front = _back; _back = swap;
             Pending = true;
@@ -102,11 +113,9 @@ internal sealed class GpuAtmosphereBackend : IDisposable
     {
         _front?.Release(); _front = null; _back?.Release(); _back = null;
         _terrain?.Release(); _terrain = null;
-        if (_bundle != null)
-        {
-            _bundle = null;
-            if (--_bundleUsers == 0 && _sharedBundle != null)
-            { _sharedBundle.Unload(true); _sharedBundle = null; }
-        }
+        if (_display != null) { _display.Release(); UnityEngine.Object.Destroy(_display); _display = null; }
+        _shader = null;
+        ClimateShaderAssets.Release();
+        _bundle = null;
     }
 }

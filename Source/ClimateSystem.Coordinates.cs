@@ -64,12 +64,12 @@ public sealed partial class ClimateSystem
 
     private float LongitudeRadiansAt(float tileX) => LongitudeDegreesAt(tileX) * Mathf.Deg2Rad;
 
-    private float LatitudeDegreesToMapY(float latitudeDegrees)
+    internal float LatitudeDegreesToMapY(float latitudeDegrees)
     {
         return Mathf.Clamp01(Mathf.InverseLerp(_latitudeMinDegrees, _latitudeMaxDegrees, latitudeDegrees));
     }
 
-    private bool TryLongitudeDegreesToMapX(float longitudeDegrees, out float normalizedX)
+    internal bool TryLongitudeDegreesToMapX(float longitudeDegrees, out float normalizedX)
     {
         float candidate = NormalizeLongitudeDegrees(longitudeDegrees);
         bool inside = candidate >= _longitudeMinDegrees && candidate <= _longitudeMaxDegrees;
@@ -78,7 +78,7 @@ public sealed partial class ClimateSystem
         return inside;
     }
 
-    private static float NormalizeLongitudeDegrees(float value)
+    internal static float NormalizeLongitudeDegrees(float value)
     {
         return Mathf.Repeat(value + 180f, 360f) - 180f;
     }
@@ -167,7 +167,6 @@ public sealed partial class ClimateSystem
         }
 
         _solarCursor = 0;
-        _nextNightRefresh = 0f;
         _biomeTransitionStates.Clear();
         _pendingBiomeTransitions.Clear();
         _pendingBareBiomeRepairs.Clear();
@@ -221,8 +220,8 @@ public sealed partial class ClimateSystem
         _coordinateRebuildStage = 0;
         _coordinateRebuildCursor = 0;
         BuildClimateTraversalOrder();
-        _layerNeedsFullRefresh = true;
-        RefreshLayer(true);
+        Fields?.MarkSurfaceDirty();
+        Fields?.MarkAtmosDirty();
         RefreshClimateAverages(true);
         return false;
     }

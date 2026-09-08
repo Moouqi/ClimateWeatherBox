@@ -90,9 +90,6 @@ public sealed partial class ClimateSystem
             float moistureGain = precipitationPerSecond * elapsed * 0.72f;
             cell.Humidity = Mathf.Min(0.98f, cell.Humidity + moistureGain);
         }
-        if (_visibleLayer == ClimateLayer.Humidity &&
-            (condensedPerSecond > 0f || precipitationPerSecond > 0f))
-            MarkLayerDirtyIndex(index, tile);
 
         Vector2 flow = AtmosphericCloudFlow(tile, cell);
         if (flow.sqrMagnitude < 0.0001f || cell.CloudCover <= 0.015f) return;
@@ -195,9 +192,6 @@ public sealed partial class ClimateSystem
             ClimateCell cell = _cells[index];
             float previous = cell.CloudCover;
             cell.CloudCover = Mathf.Clamp01(previous + delta);
-            if (_visibleLayer == ClimateLayer.Clouds &&
-                Mathf.Abs(cell.CloudCover - previous) >= 0.001f && index < tiles.Length)
-                MarkLayerDirtyIndex(index, tiles[index]);
         }
         _atmosphericCloudDeltaIndices.Clear();
     }

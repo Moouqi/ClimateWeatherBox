@@ -371,27 +371,49 @@ internal static class ClimateBiomeSpreadPatch
 }
 
 /// <summary>
-/// 复用黑暗纪元的原版建筑发光入口。这里只允许原版 LightRenderer 工作，
-/// 不创建光源、不修改建筑贴图，也不替代原版 LightBlobData 逻辑。
+/// 地图仍存在夜晚时保持原版光照管线开启，供窗户光 sprite 使用；
+/// 全图白昼（仅可能出现在局部经纬模板下）时关闭，回到零开销路径。
 /// </summary>
 [HarmonyPatch(typeof(WorldAgeManager), nameof(WorldAgeManager.shouldShowLights))]
-internal static class OriginalDarkAgeLightsPatch
+internal static class NightLightsEnablePatch
 {
     private static void Postfix(ref bool __result)
     {
         ClimateSystem climate = ClimateSystem.Active;
-        if (climate?.OriginalDarkAgeLightingReady == true) __result = true;
+        if (climate?.HasAnyNight == true) __result = true;
     }
 }
 
-/// <summary>原版逐建筑灯光提交前，根据当地太阳高度过滤白昼建筑。</summary>
-[HarmonyPatch(typeof(QuantumSpriteLibrary), "checkBuildingLights")]
-internal static class RegionalBuildingLightsPatch
+/// <summary>
+/// light_areas 光斑经 EffectsCamera 渲染进 RT 后由 LightRenderer 以
+/// alpha = nightMod * 0.6 合成，普通纪元 nightMod 恒为 0——整条每帧
+/// 遍历全部可见单位与建筑的链路零可见输出，直接跳过。黑暗纪元
+/// nightMod &gt; 0，保持原版行为。建筑夜间的光晕由夜幕 shader 的
+/// LightMask 承担，不依赖这条链路。
+/// </summary>
+[HarmonyPatch(typeof(QuantumSpriteLibrary), "drawLightAreas")]
+internal static class SkipInvisibleLightAreasPatch
 {
-    private static bool Prefix(Building __0)
+    private static bool Prefix()
+    {
+        return (World.world?.era_manager?.getNightMod() ?? 0f) > 0f;
+    }
+}
+
+/// <summary>
+/// 窗户光 sprite 直接渲染在 Objects 层（不经 nightMod 合成）。
+/// 按建筑所在地昼夜过滤：白天的建筑不提交窗户光，夜侧保持原版效果。
+/// getBuildingLight 的唯一调用方就是窗户光循环，过滤安全。
+/// </summary>
+[HarmonyPatch(typeof(DynamicSprites), nameof(DynamicSprites.getBuildingLight))]
+internal static class FilterDayBuildingLightPatch
+{
+    private static bool Prefix(Building pBuilding, ref Sprite __result)
     {
         ClimateSystem climate = ClimateSystem.Active;
-        if (climate == null || __0?.current_tile == null) return true;
-        return climate.IsNightAt(__0.current_tile);
+        if (climate == null || pBuilding?.current_tile == null) return true;
+        if (climate.IsNightAt(pBuilding.current_tile)) return true;
+        __result = null;
+        return false;
     }
 }

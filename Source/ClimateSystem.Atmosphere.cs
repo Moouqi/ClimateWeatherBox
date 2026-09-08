@@ -7,7 +7,7 @@ public sealed partial class ClimateSystem
 {
     // Coarse atmosphere; the terrain and biome application queues remain tile based.
     private const int AtmosphereStride = 8;
-    private struct AirState
+    internal struct AirState
     {
         public float Temperature, Vapor, Cloud, Pressure, Rain;
         public Vector2 Velocity;
@@ -58,7 +58,7 @@ public sealed partial class ClimateSystem
         InitializeGpuAtmosphere();
     }
 
-    private AirState SampleAir(float x, float y)
+    internal AirState SampleAir(float x, float y)
     {
         float gx = (x - 4f) / AtmosphereStride, gy = (y - 4f) / AtmosphereStride;
         int ix = Mathf.FloorToInt(gx), iy = Mathf.FloorToInt(gy);

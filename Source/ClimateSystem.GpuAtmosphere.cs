@@ -24,9 +24,14 @@ public sealed partial class ClimateSystem
                     Motion = new Vector4(_air[i].Rain, _air[i].Velocity.x, _air[i].Velocity.y, 0),
                     Ledger = new Vector4((float)_air[i].WaterBalance, (float)_air[i].Snowfall, 0, 0) };
             _gpuAtmosphere = new GpuAtmosphereBackend(_airWidth, _airHeight, initial);
-            Debug.Log("[ClimateWeather GPU] Atmosphere enabled: " + _airWidth + "x" + _airHeight + "; asynchronous snapshots.");
+            Fields?.UseGpuAtmosTexture(_gpuAtmosphere.DisplayTexture);
+            Debug.Log("[ClimateWeather GPU] Atmosphere enabled: " + _airWidth + "x" + _airHeight + "; asynchronous snapshots, display texture written by compute.");
         }
-        catch (Exception e) { Debug.LogWarning("[ClimateWeather GPU] Atmosphere unavailable, CPU fallback: " + e.Message); }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[ClimateWeather GPU] Atmosphere unavailable, CPU fallback: " + e.Message);
+            Fields?.RestoreCpuAtmosTexture();
+        }
     }
 
     private void ConsumeGpuAtmosphere()
@@ -37,6 +42,7 @@ public sealed partial class ClimateSystem
             Debug.LogWarning("[ClimateWeather GPU] Returning to last complete CPU snapshot: " + (_gpuAtmosphere.Error ?? "timeout"));
             _gpuAtmosphere.Dispose(); _gpuAtmosphere = null;
             _airTime = _gpuSnapshotTime;
+            Fields?.RestoreCpuAtmosTexture();
             return;
         }
         if (!_gpuAtmosphere.Ready) return;
