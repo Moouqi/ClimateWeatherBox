@@ -230,6 +230,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
             _visibleLayer == ClimateLayer.AirHumidity ? ClimateLayer.Rainfall :
             _visibleLayer == ClimateLayer.Rainfall ? ClimateLayer.Rainfall : ClimateLayer.Humidity);
         if (World.world == null || World.world.tiles_list == null || World.world.tiles_list.Length == 0) return;
+        // SmoothLoader 加载阶段资产库仍在初始化（雷击结算依赖的 terraform
+        // 选项可能尚未注册），气候模拟一律等加载完成后再启动。
+        if (SmoothLoader.isLoading()) return;
         ApplyPendingCoordinateRange();
         if (!EnsureWorld()) return;
         if (StepCoordinateRangeRebuild()) return;
@@ -1498,6 +1501,31 @@ public sealed partial class ClimateSystem : MonoBehaviour
         }
     }
 
+    private static TerraformOptions _lightningOptions;
+    private static bool _lightningOptionsResolved;
+
+    /// <summary>雷击结算入口：lightning_normal 选项缺失时只保留闪电视觉效果，
+    /// 避免 spawnLightningSmall 把空选项传进 damageWorld 引发整体失败。</summary>
+    private static void SpawnLightning(WorldTile tile, float scale)
+    {
+        if (!_lightningOptionsResolved)
+        {
+            _lightningOptionsResolved = true;
+            _lightningOptions = AssetManager.terraform != null
+                ? AssetManager.terraform.get("lightning_normal")
+                : null;
+            if (_lightningOptions == null)
+                Debug.LogWarning("[ClimateWeather] 缺少 terraform 选项 lightning_normal，雷击仅保留视觉效果。");
+        }
+        if (_lightningOptions != null)
+        {
+            MapBox.spawnLightningSmall(tile, scale, null);
+            return;
+        }
+        BaseEffect fx = EffectsLibrary.spawnAtTile("fx_lightning_small", tile, scale);
+        if (fx != null && fx.sprite_renderer != null) fx.sprite_renderer.flipX = Randy.randomBool();
+    }
+
     private void GenerateWeather()
     {
         WorldTile[] tiles = World.world.tiles_list;
@@ -1568,7 +1596,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
             if (c.Humidity > 0.68f && c.Temperature > 0.48f &&
                 UnityEngine.Random.value < 0.012f * convection * _ageClimateProfile.StormMultiplier)
             {
-                MapBox.spawnLightningSmall(tile, 0.2f + convection * 0.18f, null);
+                SpawnLightning(tile, 0.2f + convection * 0.18f);
                 _stormEvents++;
             }
         }

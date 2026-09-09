@@ -372,7 +372,7 @@ public sealed partial class ClimateSystem
             center.CloudCover = Mathf.Min(1f, center.CloudCover + 0.035f * state.Intensity);
             if (state.Intensity > 0.62f && UnityEngine.Random.value < 0.08f * state.Intensity)
             {
-                MapBox.spawnLightningSmall(tile, 0.18f + state.Intensity * 0.18f, null);
+                SpawnLightning(tile, 0.18f + state.Intensity * 0.18f);
                 _stormEvents++;
             }
         }

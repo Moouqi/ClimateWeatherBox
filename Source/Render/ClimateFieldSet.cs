@@ -36,6 +36,7 @@ internal sealed class ClimateFieldSet : IDisposable
     private bool _surfaceOwnedByGpu;
     private Texture2D _cpuAtmos;
     private bool _wrapAtmosLongitude;
+    private Texture2D _cpuSurfaceA, _cpuSurfaceB;
 
     internal void ConfigureAtmosphereWrap(bool wrapLongitude)
     {
@@ -61,30 +62,31 @@ internal sealed class ClimateFieldSet : IDisposable
 
     public void Dispose()
     {
-        // SurfaceA/B 被 GPU 后端接管时归后端所有，这里只释放引用。
-        if (!_surfaceOwnedByGpu)
-        {
-            if (SurfaceA != null) UnityEngine.Object.Destroy(SurfaceA);
-            if (SurfaceB != null) UnityEngine.Object.Destroy(SurfaceB);
-        }
+        // CPU 纹理始终归本类所有；SurfaceA/B 引用可能被 GPU 接管为 RT，
+        // 回退时把引用切回 CPU 纹理即可，绝不销毁后端的 RT。
+        if (_cpuSurfaceA != null) UnityEngine.Object.Destroy(_cpuSurfaceA);
+        if (_cpuSurfaceB != null) UnityEngine.Object.Destroy(_cpuSurfaceB);
         if (_cpuAtmos != null) UnityEngine.Object.Destroy(_cpuAtmos);
         if (LightMask != null) UnityEngine.Object.Destroy(LightMask);
-        // Atmos 若被 GPU 接管则归后端所有，这里只释放引用。
         SurfaceA = SurfaceB = LightMask = null;
         Atmos = _cpuAtmos = null;
+        _cpuSurfaceA = _cpuSurfaceB = null;
     }
 
     internal void Ensure(int mapWidth, int mapHeight, int airWidth, int airHeight)
     {
         if (Valid && MapWidth == mapWidth && MapHeight == mapHeight &&
-            _cpuAtmos != null && _cpuAtmos.width == airWidth && _cpuAtmos.height == airHeight) return;
+            _cpuSurfaceA != null && _cpuAtmos != null && _cpuAtmos.width == airWidth) return;
         Dispose();
         MapWidth = mapWidth;
         MapHeight = mapHeight;
         _airWidth = airWidth;
         _airHeight = airHeight;
-        SurfaceA = NewTexture(mapWidth, mapHeight, TextureFormat.RGBAFloat, "ClimateSurfaceA", FilterMode.Point);
-        SurfaceB = NewTexture(mapWidth, mapHeight, TextureFormat.RGBAFloat, "ClimateSurfaceB", FilterMode.Point);
+        _cpuSurfaceA = NewTexture(mapWidth, mapHeight, TextureFormat.RGBAFloat, "ClimateSurfaceA", FilterMode.Point);
+        _cpuSurfaceB = NewTexture(mapWidth, mapHeight, TextureFormat.RGBAFloat, "ClimateSurfaceB", FilterMode.Point);
+        SurfaceA = _cpuSurfaceA;
+        SurfaceB = _cpuSurfaceB;
+        _surfaceOwnedByGpu = false;
         _cpuAtmos = NewTexture(airWidth, airHeight, TextureFormat.RGBAFloat, "ClimateAtmos", FilterMode.Bilinear);
         Atmos = _cpuAtmos;
         ApplyAtmosphereWrap(Atmos);
@@ -131,11 +133,13 @@ internal sealed class ClimateFieldSet : IDisposable
         _surfaceDirty = false;
     }
 
-    /// <summary>GPU 地表温度回退时恢复 CPU 填充与上传路径。</summary>
+    /// <summary>GPU 地表温度回退时把引用切回 CPU 纹理并恢复上传路径。</summary>
     internal void RestoreCpuSurfaceTextures()
     {
         if (!_surfaceOwnedByGpu) return;
         _surfaceOwnedByGpu = false;
+        SurfaceA = _cpuSurfaceA;
+        SurfaceB = _cpuSurfaceB;
         _surfaceDirty = true;
         _nextSurfaceUpload = 0f;
     }
