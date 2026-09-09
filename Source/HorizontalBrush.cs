@@ -30,9 +30,9 @@ internal static class HorizontalBrush
         foreach (var offset in brush.pos)
         {
             int y = center.y + offset.y;
-            if (y < 0 || y >= MapBox.height) continue;
-            int x = HorizontalTopology.Wrap(center.x + offset.x,MapBox.width);
-            if (Seen.Add(y*MapBox.width+x)) tiles.Add(World.world.GetTileSimple(x,y));
+            if (HorizontalTopology.TryAddWrappedCell(center.x + offset.x, y,
+                MapBox.width, MapBox.height, Seen, out int x))
+                tiles.Add(World.world.GetTileSimple(x,y));
         }
     }
 }

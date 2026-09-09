@@ -498,8 +498,8 @@ public sealed partial class ClimateSystem
     {
         int x = pixel % MapBox.width;
         int y = pixel / MapBox.width;
-        float perlin = Mathf.PerlinNoise(x * 0.083f + _worldSeed * 0.007f,
-            y * 0.083f - _worldSeed * 0.011f);
+        float perlin = ClimateNoise(x, y, 0.083f, _worldSeed * 0.007f,
+            -_worldSeed * 0.011f);
         float hash = (RiverSourceHash(pixel ^ salt) & 1023) / 1023f;
         return perlin * 0.75f + hash * 0.25f;
     }

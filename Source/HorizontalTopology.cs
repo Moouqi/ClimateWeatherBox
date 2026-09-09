@@ -6,6 +6,29 @@ namespace ClimateWeather;
 // No Unity or game dependency: reusable by sampling, effects and future picking.
 internal static class HorizontalTopology
 {
+    internal static bool WithinWrappedRadius(float cx, float cy, float x, float y, int width, float radius)
+    {
+        float dx = Delta(cx, x, width), dy = y - cy;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    // 范围效果共用同一套归一化及去重规则，避免小地图重复伤害。
+    internal static bool TryAddWrappedCell(int x, int y, int width, int height,
+        HashSet<int> seen, out int wrappedX)
+    {
+        wrappedX = x;
+        return NormalizeCell(ref wrappedX, y, width, height, true) &&
+            seen.Add(y * width + wrappedX);
+    }
+
+    // 两份相隔一个世界宽度的噪声平滑混合，使接缝处数值和一阶导数连续。
+    internal static float PeriodicBlend(float x, int width, out float wrapped)
+    {
+        wrapped = Wrap(x, width);
+        float t = wrapped / width;
+        return t * t * (3f - 2f * t);
+    }
+
     internal static bool NormalizeCell(ref int x,int y,int width,int height,bool wrap)
     {
         if (width<=0 || y<0 || y>=height) return false;
@@ -33,7 +56,9 @@ internal static class HorizontalTopology
     {
         if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
         float value = x % width;
-        return value < 0 ? value + width : value;
+        if (value < 0) value += width;
+        // 极小负数加宽度可能舍入成 width，原版会把它判为地图外并致死。
+        return value >= width ? 0f : value;
     }
 
     internal static float Delta(float from, float to, int width)

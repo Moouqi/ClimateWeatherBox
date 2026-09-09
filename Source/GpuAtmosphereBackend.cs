@@ -68,6 +68,7 @@ internal sealed class GpuAtmosphereBackend : IDisposable
         {
             _terrain.SetData(input);
             _shader.SetInt("Width", _width); _shader.SetInt("Height", _height);
+            _shader.SetInt("MapWidth", MapBox.width);
             _shader.SetInt("WrapLongitude", longitudeSpan >= 359f ? 1 : 0);
             _shader.SetFloat("LatitudeMin", latitudeMin); _shader.SetFloat("LatitudeMax", latitudeMax);
             _shader.SetFloat("LongitudeSpan", longitudeSpan); _shader.SetFloat("Clock", time);

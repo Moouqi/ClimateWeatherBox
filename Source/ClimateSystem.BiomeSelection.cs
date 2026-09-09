@@ -32,8 +32,8 @@ public sealed partial class ClimateSystem
         GetBiomeClimate(tile, ref t, ref h);
         float latitude = tile == null ? 0f : Mathf.Abs(GetSignedLatitude(tile.pos.y)) * 90f;
         float patch = tile == null ? 0f :
-            (Mathf.PerlinNoise(tile.pos.x / 24f + (_worldSeed & 1023) * .17f,
-                tile.pos.y / 24f + (_worldSeed & 2047) * .11f) - .5f) * 2f;
+            (ClimateNoise(tile.pos.x, tile.pos.y, 1f / 24f, (_worldSeed & 1023) * .17f,
+                (_worldSeed & 2047) * .11f) - .5f) * 2f;
         return BiomeSuitability.Choose(ClimateCelsius(t), h, latitude, IsSummit(tile),
             tile?.Type?.biome_asset?.id ?? string.Empty, patch);
     }

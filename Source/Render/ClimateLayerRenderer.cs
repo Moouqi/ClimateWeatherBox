@@ -148,6 +148,7 @@ public sealed class ClimateLayerRenderer : MonoBehaviour
         }
 
         ClimateLayer layer = climate.VisibleLayer;
+        climate.Fields.ConfigureAtmosphereWrap(climate.HorizontalWrap);
         bool layerVisible = layer != ClimateLayer.None;
         bool linesVisible = layer is ClimateLayer.Wind or ClimateLayer.Temperature;
         if (_layerObject != null) _layerObject.SetActive(layerVisible);

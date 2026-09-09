@@ -638,9 +638,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
         }
     }
 
-    private static float TerrainElevationAt(int x, int y, float fallback)
+    private float TerrainElevationAt(int x, int y, float fallback)
     {
-        if (x < 0 || y < 0 || x >= MapBox.width || y >= MapBox.height) return fallback;
+        // 风场的山体梯度必须采样接缝另一侧，不能把越界当作同高平地。
+        if (!HorizontalTopology.NormalizeCell(ref x, y, MapBox.width, MapBox.height, HorizontalWrap)) return fallback;
         WorldTile tile = MapBox.instance.GetTileSimple(x, y);
         return tile == null ? fallback : GetTerrainElevation(tile);
     }

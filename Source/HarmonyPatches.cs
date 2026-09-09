@@ -220,12 +220,18 @@ internal static class LocalTornadoWindPatch
 [HarmonyPatch(typeof(TornadoEffect), nameof(TornadoEffect.tornadoActionTerraform))]
 internal static class TropicalCycloneSurfacePatch
 {
-    private static bool Prefix(TornadoEffect __instance, WorldTile pTile)
+    private static bool Prefix(TornadoEffect __instance, WorldTile pTile, float pScale)
     {
         ClimateSystem climate = ClimateSystem.Active;
-        if (climate == null || !climate.IsTrackedTropicalCyclone(__instance)) return true;
-        climate.ApplyTropicalCycloneRain(__instance, pTile);
-        return pTile?.main_type?.ocean != true;
+        if (climate == null || pTile == null) return true;
+        bool tropical = climate.IsTrackedTropicalCyclone(__instance);
+        if (tropical)
+        {
+            climate.ApplyTropicalCycloneRain(__instance, pTile);
+            if (pTile.main_type?.ocean == true) return false;
+        }
+        return !climate.HorizontalWrap ||
+            !HorizontalStormTerrain.TryApply(pTile, pScale, tropical);
     }
 }
 

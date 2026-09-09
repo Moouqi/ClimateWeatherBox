@@ -4,6 +4,16 @@ namespace ClimateWeather;
 
 public sealed partial class ClimateSystem
 {
+    private float ClimateNoise(float x, float y, float scale, float offsetX, float offsetY)
+    {
+        if (!HorizontalWrap || MapBox.width <= 0)
+            return Mathf.PerlinNoise(x * scale + offsetX, y * scale + offsetY);
+        float blend = HorizontalTopology.PeriodicBlend(x, MapBox.width, out float wrapped);
+        float ny = y * scale + offsetY;
+        return Mathf.Lerp(Mathf.PerlinNoise(wrapped * scale + offsetX, ny),
+            Mathf.PerlinNoise((wrapped - MapBox.width) * scale + offsetX, ny), blend);
+    }
+
     // Climate-only neighbors. Never mutate WorldTile.neighbours shared by AI.
     private int ClimateNeighbourCount(WorldTile tile) => (tile?.neighbours?.Length ?? 0)+
         (HorizontalWrap && tile != null && MapBox.width>1 && (tile.x==0 || tile.x==MapBox.width-1) ? 1 : 0);

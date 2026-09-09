@@ -37,9 +37,9 @@ public sealed partial class ClimateSystem
         // 移动的天气尺度扰动形成非纬向、随时间演化的高低压中心；海洋上的
         // 天气系统范围和振幅略大，大陆受地表摩擦与热力破碎影响更零散。
         float weatherTime = _seasonClock * 0.0024f;
-        float synopticNoise = Mathf.PerlinNoise(
-            tile.pos.x * 0.004f + _worldSeed * 0.0017f - weatherTime,
-            tile.pos.y * 0.004f - _worldSeed * 0.0011f + weatherTime * 0.37f) - 0.5f;
+        float synopticNoise = ClimateNoise(tile.pos.x, tile.pos.y, 0.004f,
+            _worldSeed * 0.0017f - weatherTime,
+            -_worldSeed * 0.0011f + weatherTime * 0.37f) - 0.5f;
         float synoptic = synopticNoise * (ocean ? 2f : 1.5f);
 
         // 使用相对当地季节常态的温度异常，而非绝对温度，避免把寒冷极地
@@ -80,15 +80,15 @@ public sealed partial class ClimateSystem
             Mathf.Clamp01(distance / Mathf.Max(1f, halfWidthDegrees)));
     }
 
-    private static float OceanInfluence(WorldTile tile, bool ocean)
+    private float OceanInfluence(WorldTile tile, bool ocean)
     {
         if (ocean) return 1f;
-        if (tile?.neighbours == null || tile.neighbours.Length == 0) return 0f;
+        if (tile == null) return 0f;
         int water = 0;
         int valid = 0;
-        for (int i = 0; i < tile.neighbours.Length; i++)
+        for (int i = 0; i < ClimateNeighbourCount(tile); i++)
         {
-            WorldTile neighbour = tile.neighbours[i];
+            WorldTile neighbour = ClimateNeighbour(tile, i);
             if (neighbour?.Type == null) continue;
             valid++;
             if (neighbour.main_type?.ocean == true ||

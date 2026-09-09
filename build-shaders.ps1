@@ -18,7 +18,7 @@ $proc = Start-Process -FilePath "`"$UnityPath`"" `
         "-projectPath", "`"$project`"",
         "-executeMethod", "ClimateBundleBuilder.Build",
         "-logFile", "`"$log`"") `
-    -Wait -PassThru
+    -WindowStyle Hidden -Wait -PassThru
 if ($proc.ExitCode -ne 0) {
     # Some environments (restricted cache dirs) make Unity exit non-zero even
     # when the bundle itself was built; trust the artifact + build log instead.

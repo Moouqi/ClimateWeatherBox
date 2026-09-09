@@ -12,7 +12,6 @@ public sealed class HorizontalSeamPreview : MonoBehaviour
     private bool _enabled;
     private Camera _camera;
     private RenderTexture _west, _east;
-    private Rect _westMap, _eastMap;
     private readonly SeamEffectCopies _effectCopies = new SeamEffectCopies();
     private float _nextRender, _centerY, _halfHeight, _lastCaptureMs;
     private int _worldWidth, _worldHeight;
@@ -97,8 +96,8 @@ public sealed class HorizontalSeamPreview : MonoBehaviour
             EnsureResources();
             var timer = System.Diagnostics.Stopwatch.StartNew();
             _effectCopies.Prepare(_centerY - _halfHeight, _centerY + _halfHeight);
-            _westMap = Capture(_west, MapBox.width - _halfHeight);
-            _eastMap = Capture(_east, _halfHeight);
+            Capture(_west, MapBox.width - _halfHeight);
+            Capture(_east, _halfHeight);
             _lastCaptureMs = (float)timer.Elapsed.TotalMilliseconds;
             _status = $"只读：跨缝副本 {_effectCopies.Count}" + (_effectCopies.BudgetReached ? "（达到预算）" : "");
         }
@@ -129,25 +128,21 @@ public sealed class HorizontalSeamPreview : MonoBehaviour
         return texture;
     }
 
-    private Rect Capture(RenderTexture target, float x)
+    private void Capture(RenderTexture target, float x)
     {
         Camera source = Camera.main;
         _camera.CopyFrom(source);
         _camera.enabled = false;
         _camera.targetTexture = target;
         _camera.rect = new Rect(0,0,1,1);
+        // 辅助相机没有原版背景相机兜底；仅清深度会在地图外留下上一帧的云和地形。
+        _camera.clearFlags = CameraClearFlags.SolidColor;
         _camera.orthographic = true;
         _camera.orthographicSize = _halfHeight;
         _camera.aspect = 1f;
         _camera.ResetProjectionMatrix();
         _camera.transform.SetPositionAndRotation(new Vector3(x, _centerY, source.transform.position.z), source.transform.rotation);
         _camera.Render();
-        Vector3 bottomLeft = _camera.WorldToViewportPoint(Vector3.zero);
-        Vector3 topRight = _camera.WorldToViewportPoint(new Vector3(MapBox.width, MapBox.height, 0));
-        return Rect.MinMaxRect(Mathf.Min(bottomLeft.x, topRight.x) * 256f,
-            (1f - Mathf.Max(bottomLeft.y, topRight.y)) * 256f,
-            Mathf.Max(bottomLeft.x, topRight.x) * 256f,
-            (1f - Mathf.Min(bottomLeft.y, topRight.y)) * 256f);
     }
 
     private void OnGUI()
@@ -156,12 +151,12 @@ public sealed class HorizontalSeamPreview : MonoBehaviour
         GUI.depth = -100;
         Rect window = Window;
         GUI.Box(window, "左右接缝预览（F9关闭；不是主镜头拼接）");
-        DrawPane(new Rect(window.x+4, window.y+24,256,256), _west, _westMap);
-        DrawPane(new Rect(window.x+260, window.y+24,256,256), _east, _eastMap);
+        DrawPane(new Rect(window.x+4, window.y+24,256,256), _west);
+        DrawPane(new Rect(window.x+260, window.y+24,256,256), _east);
         GUI.Label(new Rect(window.x+8,window.y+280,504,22), $"{_status}；提交 {_lastCaptureMs:F1} ms / 2 Hz");
     }
 
-    private static void DrawPane(Rect pane, RenderTexture scene, Rect map)
+    private static void DrawPane(Rect pane, RenderTexture scene)
     {
         if (scene == null) return;
         GUI.BeginGroup(pane);

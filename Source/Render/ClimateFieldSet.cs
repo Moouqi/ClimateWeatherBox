@@ -35,6 +35,24 @@ internal sealed class ClimateFieldSet : IDisposable
     private bool _atmosOwnedByGpu;
     private bool _surfaceOwnedByGpu;
     private Texture2D _cpuAtmos;
+    private bool _wrapAtmosLongitude;
+
+    internal void ConfigureAtmosphereWrap(bool wrapLongitude)
+    {
+        _wrapAtmosLongitude = wrapLongitude;
+        ApplyAtmosphereWrap(_cpuAtmos);
+        if (Atmos != _cpuAtmos) ApplyAtmosphereWrap(Atmos);
+    }
+
+    private void ApplyAtmosphereWrap(Texture texture)
+    {
+        if (texture == null) return;
+        // 等压线的双线性采样与五点平滑都必须跨缝，只有 U 轴允许循环。
+        // 同时配置备用 CPU 纹理，避免 GPU 回退后重新出现断线。
+        TextureWrapMode u = _wrapAtmosLongitude ? TextureWrapMode.Repeat : TextureWrapMode.Clamp;
+        if (texture.wrapModeU != u) texture.wrapModeU = u;
+        if (texture.wrapModeV != TextureWrapMode.Clamp) texture.wrapModeV = TextureWrapMode.Clamp;
+    }
     private int _airWidth, _airHeight;
     private float _nextSurfaceUpload, _nextAtmosUpload;
 
@@ -69,6 +87,7 @@ internal sealed class ClimateFieldSet : IDisposable
         SurfaceB = NewTexture(mapWidth, mapHeight, TextureFormat.RGBAFloat, "ClimateSurfaceB", FilterMode.Point);
         _cpuAtmos = NewTexture(airWidth, airHeight, TextureFormat.RGBAFloat, "ClimateAtmos", FilterMode.Bilinear);
         Atmos = _cpuAtmos;
+        ApplyAtmosphereWrap(Atmos);
         int lightWidth = Mathf.Max(64, mapWidth / 4);
         int lightHeight = Mathf.Max(64, mapHeight / 4);
         LightMask = NewTexture(lightWidth, lightHeight, TextureFormat.RGBA32, "ClimateLightMask", FilterMode.Bilinear);
@@ -86,6 +105,7 @@ internal sealed class ClimateFieldSet : IDisposable
     {
         if (display == null) return;
         Atmos = display;
+        ApplyAtmosphereWrap(Atmos);
         _atmosOwnedByGpu = true;
         _atmosDirty = false;
     }
@@ -96,6 +116,7 @@ internal sealed class ClimateFieldSet : IDisposable
         if (!_atmosOwnedByGpu) return;
         _atmosOwnedByGpu = false;
         Atmos = _cpuAtmos;
+        ApplyAtmosphereWrap(Atmos);
         _atmosDirty = true;
         _nextAtmosUpload = 0f;
     }

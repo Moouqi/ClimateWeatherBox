@@ -14,6 +14,7 @@ RWTexture2D<float4> AtmosDisplay;
 
 int Width;
 int Height;
+int MapWidth;
 int WrapLongitude;
 float LatitudeMin;
 float LatitudeMax;
@@ -106,9 +107,19 @@ float BaselinePressure(Surface s, float signedLat, float gx, float gy, bool ocea
     float polarHigh = saturate((latitudeDegrees - 72.0) / 18.0) * northPolarStrength +
                       saturate((-latitudeDegrees - 72.0) / 18.0) * southPolarStrength;
     float weatherTime = Clock * 0.0024;
-    float synopticNoise = GradientNoise(float2(
-        gx * 0.004 + Seed * 0.0017 - weatherTime,
-        gy * 0.004 - Seed * 0.0011 + weatherTime * 0.37)) - 0.5;
+    // 与 CPU 一样使用地块坐标而非粗网格下标，否则天气尺度会相差八倍。
+    float2 position = s.Position.xy;
+    float2 offset = float2(Seed * 0.0017 - weatherTime, -Seed * 0.0011 + weatherTime * 0.37);
+    float synopticNoise;
+    if (WrapLongitude == 1 && MapWidth > 0) {
+        position.x = position.x - floor(position.x / MapWidth) * MapWidth;
+        float t = position.x / MapWidth;
+        float blend = t * t * (3.0 - 2.0 * t);
+        synopticNoise = lerp(GradientNoise(position * 0.004 + offset),
+            GradientNoise((position - float2(MapWidth, 0)) * 0.004 + offset), blend) - 0.5;
+    } else {
+        synopticNoise = GradientNoise(position * 0.004 + offset) - 0.5;
+    }
     float synoptic = synopticNoise * (ocean ? 2.0 : 1.5);
     float yearPhase = Clock / SEASON_CYCLE * 2.0 * PI;
     float zonalReferenceC = -45.0 + 39.0 * (1.0 - pow(latitude, 1.30)) +

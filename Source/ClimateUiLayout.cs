@@ -5,6 +5,9 @@ namespace ClimateWeather;
 internal static class ClimateUiLayout
 {
     private static readonly Vector3[] Corners = new Vector3[4];
+    private static int _layoutFrame = -1;
+    private static int _layoutWidth, _layoutHeight;
+    private static Rect _gameplay;
     private static float TopOf(Component component)
     {
         if (component == null || !component.gameObject.activeInHierarchy || !(component.transform is RectTransform rect)) return 0;
@@ -30,14 +33,19 @@ internal static class ClimateUiLayout
     {
         get
         {
+            // 输入、拼接相机和 IMGUI 会在同一帧多次查询，避免重复遍历所有按钮。
+            // 分辨率变化立即重算，其余布局变化最迟下一帧反映，仍跟随工具栏动画。
+            int frame = Time.frameCount;
+            int width = Screen.width, height = Screen.height;
+            if (_layoutFrame == frame && _layoutWidth == width && _layoutHeight == height)
+                return _gameplay;
             float bottom = Mathf.Clamp(Screen.height*.14f,110,200);
             var background=ToolbarButtons.instance?.main_background;
             if (background != null && background.gameObject.activeInHierarchy)
             {
                 bottom=TopOf(background);
             }
-            // Category tabs protrude above main_background. Measure actual
-            // buttons, not their layout container (which may span the screen).
+            // 分类按钮会突出背景上沿，必须测量实际按钮，不能用可能铺满屏幕的容器。
             var controller=PowerTabController.instance;
             if (controller != null)
             {
@@ -50,7 +58,11 @@ internal static class ClimateUiLayout
             var tab=PowersTab._current_tab;
             if (tab != null && tab.gameObject.activeInHierarchy && tab._power_buttons != null)
                 foreach (var button in tab._power_buttons) bottom=Mathf.Max(bottom,TopOf(button));
-            return new Rect(0,0,Screen.width,Mathf.Max(0,Screen.height-bottom-4));
+            _gameplay = new Rect(0,0,width,Mathf.Max(0,height-bottom-4));
+            _layoutFrame = frame;
+            _layoutWidth = width;
+            _layoutHeight = height;
+            return _gameplay;
         }
     }
     internal static float PanelScale => Mathf.Min(1f,Mathf.Min(Gameplay.width/301f,Gameplay.height/638f));
