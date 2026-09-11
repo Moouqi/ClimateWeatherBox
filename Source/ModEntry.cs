@@ -15,5 +15,6 @@ public sealed class ModClass : BasicMod<ModClass>
         gameObject.AddComponent<HorizontalSeamPreview>();
         gameObject.AddComponent<HorizontalCameraWrap>();
         new Harmony("WB.CLIMATE.WEATHER").PatchAll();
+        HorizontalDockPlacement.Install();
     }
 }

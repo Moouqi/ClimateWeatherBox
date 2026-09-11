@@ -14,6 +14,7 @@ internal static class HorizontalGroundMovement
         internal object Data;
         internal WorldTile[] World;
         internal bool StepReady;
+        internal bool Boat;
     }
     private sealed class Attempt { internal float Next; internal object Data; }
     private static readonly ConditionalWeakTable<Actor, Route> Routes = new();
@@ -29,7 +30,11 @@ internal static class HorizontalGroundMovement
     internal static bool Valid(Actor actor) => Routes.TryGetValue(actor, out Route route) &&
         ReferenceEquals(route.Data, actor.data) && ReferenceEquals(route.World, World.world?.tiles_list) &&
         ClimateSystem.Active?.HorizontalWrap == true && actor.isAlive() && !actor.under_forces &&
-        !actor.asset.is_boat && !actor.isFlying() && !actor.isWaterCreature() && !actor.is_inside_boat;
+        (route.Boat ? HorizontalBoatMovement.Eligible(actor) :
+            !actor.asset.is_boat && !actor.isFlying() && !actor.isWaterCreature() && !actor.is_inside_boat);
+
+    internal static bool Passable(Actor actor, WorldTile tile) => actor.asset.is_boat
+        ? HorizontalBoatMovement.Passable(tile) : Walkable(tile);
 
     // 第一版只允许普通安全陆地；特殊通行能力及火灾逃生仍交给原版。
     internal static bool Walkable(WorldTile tile) => tile?.Type != null && tile.Type.ground &&
@@ -38,23 +43,29 @@ internal static class HorizontalGroundMovement
     internal static bool TryRoute(Actor actor, WorldTile target)
     {
         if (actor?.current_tile == null || target == null || ClimateSystem.Active?.HorizontalWrap != true ||
-            MapBox.width < 3 || !actor.isAlive() || actor.under_forces || actor.asset.is_boat ||
-            actor.isFlying() || actor.isWaterCreature() || actor.is_inside_boat ||
-            !Walkable(actor.current_tile) || !Walkable(target)) return false;
+            MapBox.width < 3 || !actor.isAlive() || actor.under_forces ||
+            (actor.asset.is_boat ? !HorizontalBoatMovement.Eligible(actor) :
+                actor.isFlying() || actor.isWaterCreature() || actor.is_inside_boat) ||
+            !Passable(actor, actor.current_tile) || !Passable(actor, target))
+        { ConstructionDiagnostics.Log(actor, "RouteIneligible", target: target); return false; }
         int width = MapBox.width;
-        if (Math.Abs(actor.current_tile.x - target.x) <= width / 2f) return false;
+        if (Math.Abs(actor.current_tile.x - target.x) <= width / 2f)
+        { ConstructionDiagnostics.Log(actor, "RouteLocalFallback", target: target); return false; }
         if (!DebugConfig.isOn(DebugOption.SystemUnitPathfinding)) return false;
         // 每帧最多两次有限搜索，并限制同一单位重试频率，避免批量 AI 请求拖慢帧率。
         if (_frame != Time.frameCount) { _frame = Time.frameCount; _attempts = 0; }
-        if (_attempts >= 2) return false;
+        if (_attempts >= 2)
+        { ConstructionDiagnostics.Log(actor, "RouteFrameBudget", target: target); return false; }
         Attempt attempt = Attempts.GetOrCreateValue(actor);
-        if (ReferenceEquals(attempt.Data, actor.data) && Time.time < attempt.Next) return false;
+        if (ReferenceEquals(attempt.Data, actor.data) && Time.time < attempt.Next)
+        { ConstructionDiagnostics.Log(actor, "RouteCooldown", target: target); return false; }
         attempt.Data = actor.data; attempt.Next = Time.time + .5f; _attempts++;
         var path = new List<int>();
         var result = HorizontalGroundPathfinder.Find(width, MapBox.height,
             actor.current_tile.y * width + actor.current_tile.x, target.y * width + target.x, true,
-            p => Walkable(World.world.GetTileSimple(p % width, p / width)), 2048, path, out _);
-        if (result != HorizontalGroundPathfinder.Result.Found) return false;
+            p => Passable(actor, World.world.GetTileSimple(p % width, p / width)), 2048, path, out _);
+        if (result != HorizontalGroundPathfinder.Result.Found)
+        { ConstructionDiagnostics.Log(actor, "RouteSearchFailed", result, target); return false; }
         bool crossed = false;
         for (int i = 1; i < path.Count; i++)
             if (Math.Abs(path[i] % width - path[i - 1] % width) > 1) crossed = true;
@@ -66,6 +77,8 @@ internal static class HorizontalGroundMovement
         actor.setTileTarget(target);
         Route route = Routes.GetOrCreateValue(actor);
         route.Data = actor.data; route.World = World.world.tiles_list;
+        route.Boat = actor.asset.is_boat;
+        ConstructionDiagnostics.Log(actor, "RouteReady", path.Count, target);
         return true;
     }
 
@@ -85,7 +98,7 @@ internal static class HorizontalGroundRoutePatch
     private static bool Prefix(Actor pActor, WorldTile pTileTarget, bool pPathOnLiquid,
         bool pWalkOnBlocks, bool pPathOnLava, int pLimitPathfindingRegions, ref ExecuteEvent __result)
     {
-        if (pPathOnLiquid || pWalkOnBlocks || pPathOnLava || pLimitPathfindingRegions != 0 ||
+        if ((pPathOnLiquid && !pActor.asset.is_boat) || pWalkOnBlocks || pPathOnLava || pLimitPathfindingRegions != 0 ||
             !HorizontalGroundMovement.TryRoute(pActor, pTileTarget)) return true;
         __result = ExecuteEvent.True;
         return false;
@@ -104,7 +117,7 @@ internal static class HorizontalGroundStepPatch
     private static bool Prefix(Actor __instance, WorldTile pTileTarget)
     {
         if (!HorizontalGroundMovement.Has(__instance)) return true;
-        if (!HorizontalGroundMovement.Valid(__instance) || !HorizontalGroundMovement.Walkable(pTileTarget))
+        if (!HorizontalGroundMovement.Valid(__instance) || !HorizontalGroundMovement.Passable(__instance, pTileTarget))
         { __instance.stopMovement(); return false; }
         HorizontalGroundMovement.BeginStep(__instance);
         if (Math.Abs(__instance.current_position.x - pTileTarget.x) <= MapBox.width * .5f) return true;
@@ -133,7 +146,7 @@ internal static class HorizontalGroundAdvancePatch
         for (int step = 0; step < 64 && __instance.is_moving; step++)
         {
             WorldTile tile = __instance._next_step_tile;
-            if (!HorizontalGroundMovement.Walkable(tile)) { __instance.stopMovement(); break; }
+            if (!HorizontalGroundMovement.Passable(__instance, tile)) { __instance.stopMovement(); break; }
             Vector2 target = tile.posV3;
             target.x = __instance.current_position.x +
                 HorizontalTopology.Delta(__instance.current_position.x, target.x, MapBox.width);
