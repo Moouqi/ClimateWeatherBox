@@ -329,7 +329,7 @@ public sealed partial class ClimateSystem
     }
 
     internal bool IsTrackedTropicalCyclone(TornadoEffect effect) =>
-        effect != null && _tropicalCycloneStates.TryGetValue(effect, out _);
+        ClimateFeatures.Climate && effect != null && _tropicalCycloneStates.TryGetValue(effect, out _);
 
     internal bool TryGetTropicalCycloneTarget(TornadoEffect effect, WorldTile tile,
         out WorldTile target)

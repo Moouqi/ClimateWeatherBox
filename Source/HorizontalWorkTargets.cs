@@ -44,9 +44,13 @@ internal static class HorizontalWorkTargets
         return found;
     }
 
-    internal static bool BuildingReachable(Building building, Actor actor) =>
-        building.isSameIslandAs(actor) || (actor.city != null && building.current_tile.zone.city == actor.city &&
+    internal static bool BuildingReachable(Building building, Actor actor)
+    {
+        bool result = building.isSameIslandAs(actor) || (actor.city != null && building.current_tile.zone.city == actor.city &&
             Reachable(actor.current_tile, building.current_tile));
+        WoodSelectionDiagnostics.Candidate(building, actor, result);
+        return result;
+    }
 
     internal static int Distance(WorldTile a, WorldTile b)
     {

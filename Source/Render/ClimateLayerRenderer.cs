@@ -130,7 +130,7 @@ public sealed class ClimateLayerRenderer : MonoBehaviour
     private void UpdateRenderer()
     {
         ClimateSystem climate = ClimateSystem.Active;
-        bool visible = _mapBuilt && !_assetsFailed && climate != null &&
+        bool visible = ClimateFeatures.Climate && _mapBuilt && !_assetsFailed && climate != null &&
                        climate.ReadyForRendering && World.world != null &&
                        !ClimateUiLayout.NativePopupVisible;
         if (!visible)
@@ -153,7 +153,7 @@ public sealed class ClimateLayerRenderer : MonoBehaviour
         bool linesVisible = layer is ClimateLayer.Wind or ClimateLayer.Temperature;
         if (_layerObject != null) _layerObject.SetActive(layerVisible);
         if (_lineObject != null) _lineObject.SetActive(linesVisible);
-        if (_nightObject != null) _nightObject.SetActive(true);
+        if (_nightObject != null) _nightObject.SetActive(ClimateFeatures.Night);
 
         if (layerVisible && _layerMaterial != null)
         {

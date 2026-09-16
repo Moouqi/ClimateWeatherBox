@@ -68,6 +68,7 @@ internal static class ConstructionSelectionDiagnostics
     }
     internal static bool Record(bool value, string reason)
     {
+        WoodSelectionDiagnostics.Record(reason);
         if (Current?.Active == true) Current.Reason = reason;
         return value;
     }

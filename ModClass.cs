@@ -230,9 +230,9 @@ public sealed partial class ClimateSystem : MonoBehaviour
             _visibleLayer == ClimateLayer.AirHumidity ? ClimateLayer.Rainfall :
             _visibleLayer == ClimateLayer.Rainfall ? ClimateLayer.Rainfall : ClimateLayer.Humidity);
         if (World.world == null || World.world.tiles_list == null || World.world.tiles_list.Length == 0) return;
-        // SmoothLoader 加载阶段资产库仍在初始化（雷击结算依赖的 terraform
-        // 选项可能尚未注册），气候模拟一律等加载完成后再启动。
+        // 加载期间资产库未就绪，保留安装版本原有的模拟启动保护。
         if (SmoothLoader.isLoading()) return;
+        if (!ClimateFeatures.Climate) return;
         ApplyPendingCoordinateRange();
         if (!EnsureWorld()) return;
         if (StepCoordinateRangeRebuild()) return;
@@ -240,7 +240,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         Bench.bench("mod.TerrainChanges", "cpu");
         ProcessTerrainChanges();
         Bench.benchEnd("mod.TerrainChanges", "cpu", false, 0);
-        TryStartAutomaticRiverGeneration();
+        if (ClimateFeatures.Enabled(ClimateFeatures.Feature.Rivers)) TryStartAutomaticRiverGeneration();
         StepRiverMoistureField();
         Bench.bench("mod.DisplayFields", "cpu");
         RefreshDisplayFields();
@@ -266,7 +266,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         StepClimate();
         Bench.benchEnd("mod.StepClimate", "cpu", false, 0);
         Bench.bench("mod.StepRivers", "cpu");
-        StepRivers();
+        if (ClimateFeatures.Enabled(ClimateFeatures.Feature.Rivers)) StepRivers();
         Bench.benchEnd("mod.StepRivers", "cpu", false, 0);
         Bench.bench("mod.Weather", "cpu");
         GenerateWeather();
@@ -480,7 +480,8 @@ public sealed partial class ClimateSystem : MonoBehaviour
             }
             droughtTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
             segment = System.Diagnostics.Stopwatch.GetTimestamp();
-            EvaluateClimateBiome(index, tiles[index], _cells[index]);
+            if (ClimateFeatures.Enabled(ClimateFeatures.Feature.BiomeChanges))
+                EvaluateClimateBiome(index, tiles[index], _cells[index]);
             biomeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - segment;
             segment = System.Diagnostics.Stopwatch.GetTimestamp();
             ApplyPolarFreezing(tiles[index], _cells[index]);
@@ -488,10 +489,10 @@ public sealed partial class ClimateSystem : MonoBehaviour
         }
         _cursor = (_cursor + count) % _climateTraversalOrder.Length;
         Bench.bench("mod.Climate.Repair", "cpu");
-        RepairBareBiomeTiles(tiles);
+        if (ClimateFeatures.Enabled(ClimateFeatures.Feature.BiomeChanges)) RepairBareBiomeTiles(tiles);
         Bench.benchEnd("mod.Climate.Repair", "cpu", false, 0);
         Bench.bench("mod.Climate.BiomeApply", "cpu");
-        ApplyQueuedBiomeTransitions(tiles, BiomeChanges);
+        if (ClimateFeatures.Enabled(ClimateFeatures.Feature.BiomeChanges)) ApplyQueuedBiomeTransitions(tiles, BiomeChanges);
         Bench.benchEnd("mod.Climate.BiomeApply", "cpu", false, 0);
         if (!Bench.bench_enabled) return;
         double toSeconds = 1.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -856,6 +857,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void UpdateLavaCooling(WorldTile tile, ClimateCell cell)
     {
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.Terrain)) return;
         if (tile?.data == null) return;
         int tileId = tile.data.tile_id;
         if (tile.Type?.lava != true)
@@ -1083,6 +1085,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     /// </summary>
     private bool UpdateExtremeDroughtTerrain(WorldTile tile, ClimateCell cell)
     {
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.Terrain)) return false;
         if (tile?.data == null || tile.main_type == null || tile.Type == null || cell == null)
             return false;
         int tileId = tile.data.tile_id;
@@ -1095,7 +1098,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
                 return false;
             }
             if (cell.Humidity < DroughtRecoveryHumidity) return false;
-            MapAction.terraformTile(tile, snapshot.Main, snapshot.Top, TerraformLibrary.nothing);
+            DroughtOccupancy.Terraform(tile, snapshot.Main, snapshot.Top);
             _droughtSandTerrain.Remove(tileId);
             _biomeTransitionStates.Remove(tileId);
             _acceptedBiomeExpansions.Remove(tileId);
@@ -1104,19 +1107,21 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
         if (cell.Humidity >= ExtremeDroughtHumidity || tile.data.frozen ||
             tile.main_type.ocean || tile.main_type.liquid || tile.Type.lava ||
-            tile.building != null || tile.zone?.city != null) return false;
+            DroughtOccupancy.Blocks(tile.building) || tile.zone?.city != null) return false;
         // 沙化只改变可生长群系的普通土壤，不削平丘陵、山峰和特殊地块。
         if (tile.main_type != TileLibrary.soil_low && tile.main_type != TileLibrary.soil_high)
             return false;
         string biomeId = tile.Type.biome_asset?.id ?? string.Empty;
         if (!ManagedBiomes.Contains(biomeId)) return false;
 
+        // 仅在全部沙化条件成立后移除植物；恢复湿度不会复活已移除的植物。
+        if (DroughtOccupancy.Vegetation(tile.building)) tile.building.startDestroyBuilding();
         _droughtSandTerrain[tileId] = new DroughtTerrainSnapshot
         {
             Main = tile.main_type,
             Top = tile.top_type
         };
-        MapAction.terraformTile(tile, TileLibrary.sand, null, TerraformLibrary.nothing);
+        DroughtOccupancy.Terraform(tile, TileLibrary.sand, null);
         _biomeTransitionStates.Remove(tileId);
         _acceptedBiomeExpansions.Remove(tileId);
         return true;
@@ -1128,6 +1133,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     /// </summary>
     private void UpdateVegetationTemperatureStress(WorldTile tile, ClimateCell cell)
     {
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.Terrain)) return;
         Building vegetation = tile?.building;
         if (vegetation?.asset == null || cell == null || vegetation.current_tile != tile ||
             !vegetation.isAlive() || vegetation.isRuin() || vegetation.isOnRemove()) return;
@@ -1195,6 +1201,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void ApplyPolarFreezing(WorldTile tile, ClimateCell cell)
     {
+        if (!ClimateFeatures.Climate || !ClimateFeatures.Enabled(ClimateFeatures.Feature.Terrain)) return;
         if (tile?.Type == null || tile.data == null || tile.main_type == null) return;
         int tileId = tile.data.tile_id;
         if (!TryGetFreezeThreshold(tile, out float freezeThreshold)) return;
@@ -1248,6 +1255,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     internal bool ShouldBlockClimateUnfreeze(WorldTile tile)
     {
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.Terrain)) return false;
         if (tile?.data == null || tile.main_type?.ocean == true ||
             !_climateFrozenTiles.Contains(tile.data.tile_id)) return false;
         if (!TryGetClimate(tile, out ClimateCell cell) || !TryGetFreezeThreshold(tile, out float threshold)) return false;
@@ -1504,16 +1512,14 @@ public sealed partial class ClimateSystem : MonoBehaviour
     private static TerraformOptions _lightningOptions;
     private static bool _lightningOptionsResolved;
 
-    /// <summary>雷击结算入口：lightning_normal 选项缺失时只保留闪电视觉效果，
-    /// 避免 spawnLightningSmall 把空选项传进 damageWorld 引发整体失败。</summary>
+    // 保留安装版本的雷击保护：选项缺失时只播放视觉效果。
     private static void SpawnLightning(WorldTile tile, float scale)
     {
         if (!_lightningOptionsResolved)
         {
             _lightningOptionsResolved = true;
             _lightningOptions = AssetManager.terraform != null
-                ? AssetManager.terraform.get("lightning_normal")
-                : null;
+                ? AssetManager.terraform.get("lightning_normal") : null;
             if (_lightningOptions == null)
                 Debug.LogWarning("[ClimateWeather] 缺少 terraform 选项 lightning_normal，雷击仅保留视觉效果。");
         }
@@ -1528,6 +1534,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void GenerateWeather()
     {
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.Weather)) return;
         WorldTile[] tiles = World.world.tiles_list;
         PruneTrackedRainClouds();
         int maxActiveClouds = Mathf.Clamp(tiles.Length / 1024, 24, 72);
@@ -1790,6 +1797,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void EvaluateClimateBiome(int cellIndex, WorldTile tile, ClimateCell c)
     {
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.BiomeChanges)) return;
         if (tile?.Type == null || tile.data == null || tile.main_type?.ocean == true)
         {
             InvalidateQueuedBiome(cellIndex);
@@ -2072,6 +2080,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
     internal bool TryGetClimate(WorldTile tile, out ClimateCell cell)
     {
         cell = null;
+        if (!ClimateFeatures.Climate) return false;
         if (tile == null || _cellIndexByPixel.Length == 0) return false;
         int pixel = tile.pos.y * MapBox.width + tile.pos.x;
         if (pixel < 0 || pixel >= _cellIndexByPixel.Length) return false;
@@ -2150,13 +2159,12 @@ public sealed partial class ClimateSystem : MonoBehaviour
 
     private void OnGUI()
     {
-        if (_cells.Length == 0) return;
         // WorldBox 的滚动/模态窗口由独立 Canvas 绘制；本模组的 OnGUI 层级在其后。
         // 任意窗口打开时暂停全部覆盖层，避免夜幕、图层和提示框压暗弹窗。
         if (ClimateUiLayout.NativePopupVisible) return;
         Bench.bench("mod.OnGUI", "cpu");
         Bench.bench("mod.OverlayText", "cpu");
-        DrawOverlayText();
+        if (ClimateFeatures.Climate && _cells.Length > 0) DrawOverlayText();
         Bench.benchEnd("mod.OverlayText", "cpu", false, 0);
         if (!_showPanel) { Bench.benchEnd("mod.OnGUI", "cpu", false, 0); return; }
         Matrix4x4 previousMatrix=GUI.matrix;
@@ -2166,6 +2174,14 @@ public sealed partial class ClimateSystem : MonoBehaviour
         try
         {
         GUI.depth = -10;
+        // 设置入口即使模拟停用、世界尚未初始化也必须可达。
+        if (_showFeatureSettings || !ClimateFeatures.Climate || _cells.Length == 0)
+        {
+            GUI.Box(new Rect(8, 80, 285, 520), "功能设置 [F8]");
+            DrawFeatureSettings();
+            if (GUI.Button(new Rect(18, 604, 250, 24), "返回气候面板")) _showFeatureSettings = false;
+            return;
+        }
         RefreshClimateAverages();
         string season = SeasonName();
         GUI.Box(new Rect(8, 80, 285, 550), "气候与四季 [F8] · " +
@@ -2175,7 +2191,6 @@ public sealed partial class ClimateSystem : MonoBehaviour
         GUI.Label(new Rect(18, 149, 265, 22), $"累计：雨云 {_rainEvents} 雷暴 {_stormEvents} 龙卷 {_tornadoEvents}");
         GUI.Label(new Rect(18, 555, 270, 22), $"热带系统：累计生成 {_cycloneTotalEvents} / 当前活跃 {ActiveCycloneCount()}");
         GUI.Label(new Rect(18, 577, 270, 22), $"阶段去重：低压 {_depressionEvents} / 风暴 {_tropicalStormEvents}");
-        GUI.Label(new Rect(18, 599, 270, 22), $"累计命名：台风 {_typhoonEvents} 飓风 {_hurricaneEvents} 气旋 {_tropicalCycloneEvents}");
         GUI.Label(new Rect(18, 171, 270, 22), $"F3 云 F4 高 F5 风 F6 温 F7 湿  当前：{LayerName()}");
         GUI.Label(new Rect(18, 193, 55, 22), "模板：");
         if (GUI.Button(new Rect(68, 193, 58, 24), TemplateButtonName(ClimateTemplate.NorthernHemisphere)))
@@ -2192,7 +2207,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
             ? $"生成中 {_pendingRiverPixels.Count}"
             : Time.unscaledTime < _riverButtonStatusUntil ? _riverButtonStatus : "生成河流";
         bool previousEnabled = GUI.enabled;
-        GUI.enabled = previousEnabled && !riverBusy;
+        GUI.enabled = previousEnabled && !riverBusy && ClimateFeatures.Enabled(ClimateFeatures.Feature.Rivers);
         if (GUI.Button(new Rect(192, 220, 76, 25), riverButtonText)) TriggerRiverGeneration();
         GUI.enabled = previousEnabled;
         float greenhouseCelsius = _greenhouseGasLevel * 33f;
@@ -2222,6 +2237,7 @@ public sealed partial class ClimateSystem : MonoBehaviour
         SetLongitudeMaximum(GUI.HorizontalSlider(new Rect(18, 523, 250, 18),
             _longitudeMaxDegrees, _longitudeMinDegrees + 10f, 180f));
         TrackCoordinateSliderInteraction();
+        if (GUI.Button(new Rect(18, 604, 250, 24), "功能开关")) _showFeatureSettings = true;
         }
         finally { GUI.matrix=previousMatrix; GUI.EndGroup(); Bench.benchEnd("mod.OnGUI", "cpu", false, 0); }
     }

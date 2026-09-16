@@ -53,6 +53,7 @@ internal static class LocalCloudWindPatch
 
     private static void Prefix(Cloud __instance, float pElapsed, ref FrameState __state)
     {
+        if (!ClimateFeatures.Climate) return;
         if (__instance == null) return;
         __state.OriginalSpeed = __instance.speed;
         __state.Elapsed = pElapsed;
@@ -108,6 +109,7 @@ internal static class LocalCloudWindPatch
 
     private static void Postfix(Cloud __instance, FrameState __state)
     {
+        if (!ClimateFeatures.Climate) return;
         if (__instance == null) return;
         if (__state.ReplacedMovement) __instance.speed = __state.OriginalSpeed;
         if (__state.Motion != null) __state.Motion.LastAliveTime = __instance.alive_time;
@@ -357,6 +359,7 @@ internal static class ClimateBiomeSpreadPatch
     private static bool Prefix(WorldTile __0, TopTileType __1, out bool __state)
     {
         __state = false;
+        if (!ClimateFeatures.Enabled(ClimateFeatures.Feature.BiomeLimits)) return true;
         if (__0 == null || __1?.biome_asset == null) return true;
         if (!ClimateSystem.ManagedBiomesForPatch.Contains(__1.biome_asset.id)) return true;
         ClimateSystem climate = ClimateSystem.Active;
@@ -386,7 +389,7 @@ internal static class NightLightsEnablePatch
     private static void Postfix(ref bool __result)
     {
         ClimateSystem climate = ClimateSystem.Active;
-        if (climate?.HasAnyNight == true) __result = true;
+        if (ClimateFeatures.Night && climate?.HasAnyNight == true) __result = true;
     }
 }
 
@@ -402,7 +405,7 @@ internal static class SkipInvisibleLightAreasPatch
 {
     private static bool Prefix()
     {
-        return (World.world?.era_manager?.getNightMod() ?? 0f) > 0f;
+        return !ClimateFeatures.Night || (World.world?.era_manager?.getNightMod() ?? 0f) > 0f;
     }
 }
 
@@ -416,6 +419,7 @@ internal static class FilterDayBuildingLightPatch
 {
     private static bool Prefix(Building pBuilding, ref Sprite __result)
     {
+        if (!ClimateFeatures.Night) return true;
         ClimateSystem climate = ClimateSystem.Active;
         if (climate == null || pBuilding?.current_tile == null) return true;
         if (climate.IsNightAt(pBuilding.current_tile)) return true;

@@ -56,6 +56,9 @@ internal static class HorizontalForcedPositionPatch
 {
     private static void Prefix(Actor __instance, out HorizontalForcedMovement.State __state)
     {
+        // 普通战斗击退同样会把船推出边界，不能只登记由气候风暴施加的力。
+        if (__instance.asset?.is_boat == true && __instance.under_forces &&
+            ClimateSystem.Active?.HorizontalWrap == true) HorizontalForcedMovement.Track(__instance);
         __state = HorizontalForcedMovement.Get(__instance);
         if (__state != null) __state.Crossed = false;
     }

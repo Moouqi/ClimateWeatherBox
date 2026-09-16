@@ -16,7 +16,7 @@ public sealed partial class ClimateSystem
     private const float LightMaskRefreshSeconds = 0.4f;
     private float _nextSurfaceRefresh, _nextAtmosRefresh, _nextLightMaskRefresh;
 
-    internal bool ReadyForRendering => Fields != null && Fields.Valid && _cells.Length > 0;
+    internal bool ReadyForRendering => ClimateFeatures.Climate && Fields != null && Fields.Valid && _cells.Length > 0;
     internal ClimateLayer VisibleLayer => _visibleLayer;
     internal float SimClock => _seasonClock;
 

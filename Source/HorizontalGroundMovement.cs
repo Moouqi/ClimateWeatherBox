@@ -40,7 +40,7 @@ internal static class HorizontalGroundMovement
     internal static bool Walkable(WorldTile tile) => tile?.Type != null && tile.Type.ground &&
         !tile.Type.block && !tile.Type.lava && !tile.Type.liquid && !tile.isOnFire();
 
-    internal static bool TryRoute(Actor actor, WorldTile target)
+    internal static bool TryRoute(Actor actor, WorldTile target, bool boatFallback = false)
     {
         if (actor?.current_tile == null || target == null || ClimateSystem.Active?.HorizontalWrap != true ||
             MapBox.width < 3 || !actor.isAlive() || actor.under_forces ||
@@ -49,27 +49,39 @@ internal static class HorizontalGroundMovement
             !Passable(actor, actor.current_tile) || !Passable(actor, target))
         { ConstructionDiagnostics.Log(actor, "RouteIneligible", target: target); return false; }
         int width = MapBox.width;
-        if (Math.Abs(actor.current_tile.x - target.x) <= width / 2f)
+        // 不同原版海域可能只能经接缝连通，不能仅凭横向距离判为本地航线。
+        bool connectedAcrossSeam = actor.asset.is_boat &&
+            actor.current_tile.region?.island != target.region?.island &&
+            HorizontalOceanConnectivity.Connected(actor.current_tile, target);
+        boatFallback = boatFallback && actor.asset.is_boat && HorizontalOceanConnectivity.Connected(actor.current_tile, target);
+        if (Math.Abs(actor.current_tile.x - target.x) <= width / 2f && !connectedAcrossSeam && !boatFallback)
         { ConstructionDiagnostics.Log(actor, "RouteLocalFallback", target: target); return false; }
         if (!DebugConfig.isOn(DebugOption.SystemUnitPathfinding)) return false;
         // 每帧最多两次有限搜索，并限制同一单位重试频率，避免批量 AI 请求拖慢帧率。
         if (_frame != Time.frameCount) { _frame = Time.frameCount; _attempts = 0; }
         if (_attempts >= 2)
-        { ConstructionDiagnostics.Log(actor, "RouteFrameBudget", target: target); return false; }
+        { BoatTransportDiagnostics.RouteFailure(actor, target, "FrameBudget"); ConstructionDiagnostics.Log(actor, "RouteFrameBudget", target: target); return false; }
         Attempt attempt = Attempts.GetOrCreateValue(actor);
         if (ReferenceEquals(attempt.Data, actor.data) && Time.time < attempt.Next)
-        { ConstructionDiagnostics.Log(actor, "RouteCooldown", target: target); return false; }
+        { BoatTransportDiagnostics.RouteFailure(actor, target, "Cooldown"); ConstructionDiagnostics.Log(actor, "RouteCooldown", target: target); return false; }
         attempt.Data = actor.data; attempt.Next = Time.time + .5f; _attempts++;
         var path = new List<int>();
         var result = HorizontalGroundPathfinder.Find(width, MapBox.height,
             actor.current_tile.y * width + actor.current_tile.x, target.y * width + target.x, true,
-            p => Passable(actor, World.world.GetTileSimple(p % width, p / width)), 2048, path, out _);
+            p => Passable(actor, World.world.GetTileSimple(p % width, p / width)), 2048, path, out int expanded);
         if (result != HorizontalGroundPathfinder.Result.Found)
-        { ConstructionDiagnostics.Log(actor, "RouteSearchFailed", result, target); return false; }
+        { BoatTransportDiagnostics.RouteFailure(actor, target, result.ToString(), expanded); ConstructionDiagnostics.Log(actor, "RouteSearchFailed", result, target); return false; }
         bool crossed = false;
         for (int i = 1; i < path.Count; i++)
             if (Math.Abs(path[i] % width - path[i - 1] % width) > 1) crossed = true;
-        if (!crossed) return false;
+        if (!crossed && !boatFallback) return false;
+        ApplyRoute(actor, target, path);
+        return true;
+    }
+
+    internal static void ApplyRoute(Actor actor, WorldTile target, List<int> path)
+    {
+        int width = MapBox.width;
         actor.clearOldPath();
         actor.split_path = SplitPathStatus.Normal;
         for (int i = 1; i < path.Count; i++)
@@ -78,8 +90,8 @@ internal static class HorizontalGroundMovement
         Route route = Routes.GetOrCreateValue(actor);
         route.Data = actor.data; route.World = World.world.tiles_list;
         route.Boat = actor.asset.is_boat;
+        if (route.Boat) HorizontalBoatTransport.Track(actor);
         ConstructionDiagnostics.Log(actor, "RouteReady", path.Count, target);
-        return true;
     }
 
     internal static void SetPosition(Actor actor, Vector2 p)
@@ -95,6 +107,14 @@ internal static class HorizontalGroundMovement
 [HarmonyPatch(typeof(ActorMove), nameof(ActorMove.goTo))]
 internal static class HorizontalGroundRoutePatch
 {
+    private static void Postfix(Actor pActor, WorldTile pTileTarget, bool pWalkOnBlocks,
+        bool pPathOnLava, int pLimitPathfindingRegions, ref ExecuteEvent __result)
+    {
+        // 原版局部/区域寻路失败时，连通海域仍可尝试受预算约束的逐格航路。
+        if (__result == ExecuteEvent.False && pActor?.asset?.is_boat == true &&
+            !pWalkOnBlocks && !pPathOnLava && pLimitPathfindingRegions == 0 &&
+            HorizontalGroundMovement.TryRoute(pActor, pTileTarget, true)) __result = ExecuteEvent.True;
+    }
     private static bool Prefix(Actor pActor, WorldTile pTileTarget, bool pPathOnLiquid,
         bool pWalkOnBlocks, bool pPathOnLava, int pLimitPathfindingRegions, ref ExecuteEvent __result)
     {
